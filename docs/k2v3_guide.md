@@ -94,7 +94,7 @@ python train_v7/train.py \
 6. **Backward + AdamW + EMA**: обновление весов
 
 ### Время обучения
-~8 часов на RTX 4090 (24 GB). На маленьких grid — 30+ steps/sec, на больших — 1-2 steps/sec.
+~8 часов на RTX 3090 Ti (24 GB). На маленьких grid — 30+ steps/sec, на больших — 1-2 steps/sec.
 
 ### Мониторинг
 ```bash

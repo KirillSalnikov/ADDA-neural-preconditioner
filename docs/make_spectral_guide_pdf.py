@@ -206,7 +206,7 @@ def page4_training(pdf):
         ['--curriculum_frac', '0.25', '25% обучения: grid растёт от min до max'],
         ['--lr', '1e-3', 'Скорость обучения'],
         ['--ema_decay', '0.999', 'Скользящее среднее весов (сглаживает шум)'],
-        ['--num_steps', '60000', 'Число шагов обучения (6–9 часов на RTX 4090)'],
+        ['--num_steps', '60000', 'Число шагов обучения (6–9 часов на RTX 3090 Ti)'],
     ]
     t = ax.table(cellText=params[1:], colLabels=params[0],
                  cellLoc='left', loc='center',

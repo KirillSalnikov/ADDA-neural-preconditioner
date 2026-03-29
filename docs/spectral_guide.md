@@ -235,7 +235,7 @@ tail -f results/spectral_v3_adda/train.log
 
 ### 5. Время обучения
 
-- GPU: RTX 4090 (24 GB)
+- GPU: RTX 3090 Ti (24 GB)
 - Маленькие grid (8-20): ~50 steps/sec
 - Большие grid (48-64): ~1-2 steps/sec
 - 60K шагов ≈ 6-9 часов
@@ -475,7 +475,7 @@ alpha = alpha_CM / (1 - (alpha_CM/V)·M)
 ## Быстрый старт (копировать-вставить)
 
 ```bash
-# 1. Обучение (6-9 часов на RTX 4090)
+# 1. Обучение (6-9 часов на RTX 3090 Ti)
 python train_v7/train.py --name my_spectral --device 0 --save \
     --loss adversarial --spectral --squared_kernel \
     --freq_hidden 256 --freq_layers 5 \

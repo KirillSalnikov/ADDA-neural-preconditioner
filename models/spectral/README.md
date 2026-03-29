@@ -53,7 +53,7 @@ python train_v7/train.py \
     --curriculum_frac 0.25 --lr 1e-3
 ```
 
-Время обучения: ~9 часов на RTX 4090.
+Время обучения: ~9 часов на RTX 3090 Ti.
 
 ## Экспорт для ADDA
 
