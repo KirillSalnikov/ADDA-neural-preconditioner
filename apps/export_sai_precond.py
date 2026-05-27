@@ -29,7 +29,10 @@ from adda_matrix import (
     make_sphere_dipoles, make_cube_dipoles, make_ellipsoid_dipoles,
     build_interaction_matrix,
 )
-from apps.generate_sai_dataset import build_sai_graph
+try:
+    from apps.generate_sai_dataset import build_sai_graph
+except ImportError:
+    build_sai_graph = None
 from core.models import NeuralSAI
 
 PRECOND_MAGIC = 0x4E49464C
@@ -201,6 +204,10 @@ def main():
           f"matrix: {n}x{n}")
 
     # Build graph with extended features
+    if build_sai_graph is None:
+        raise ImportError(
+            "apps.generate_sai_dataset is unavailable; SAI export cannot build the graph"
+        )
     data = build_sai_graph(positions, k, m, d=d, r_cut=args.r_cut)
 
     # Load model
