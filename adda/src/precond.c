@@ -42,6 +42,9 @@ extern size_t gridX,gridY,gridZ;
 bool use_precond=false;
 PrecondData precond;
 
+#define CONVSAI_DIRECT_DEFAULT_MAX_STENCIL 8192
+#define CONVSAI_DIRECT_PRECOMPUTE_DEFAULT_MB 256
+
 // MatVec from matvec.c — needed for POLY mode Horner evaluation
 void MatVec(doublecomplex * restrict in,doublecomplex * restrict out,double * inprod,bool her,
 	TIME_TYPE *timing,TIME_TYPE *comm_timing);
@@ -255,6 +258,7 @@ static void BuildConvSAIDirectNeighbors(void)
 }
 
 //======================================================================================================================
+
 static void LoadSAI(FILE *f,const char *filename)
 {
 	// Allocate SAI arrays
@@ -337,6 +341,20 @@ static void LoadFFTDirect(FILE *f,const char *filename)
 	precond.conv_gy=gy;
 	precond.conv_gz=gz;
 	precond.conv_gridN=gridN;
+	precond.conv_direct=false;
+	precond.conv_n_stencil=0;
+	precond.conv_stencil=NULL;
+	precond.conv_kernel=NULL;
+	precond.conv_grid_to_dipole=NULL;
+	precond.conv_direct_edges=0;
+	precond.conv_direct_row_ptr=NULL;
+	precond.conv_direct_dipole=NULL;
+	precond.conv_direct_stencil=NULL;
+	precond.conv_Phat=NULL;
+	precond.conv_work_in=NULL;
+	precond.conv_work_out=NULL;
+	precond.conv_plan_fwd=NULL;
+	precond.conv_plan_bwd=NULL;
 
 	/* Allocate Phat and read directly */
 	precond.conv_Phat=(doublecomplex *)voidVector(9*gridN*sizeof(doublecomplex),ALL_POS,"fftdirect Phat");
@@ -402,6 +420,31 @@ static void LoadConvSAI(FILE *f,const char *filename)
 	precond.conv_gy=gy;
 	precond.conv_gz=gz;
 	precond.conv_gridN=gridN;
+	precond.conv_n_stencil=n_stencil;
+	precond.conv_stencil=NULL;
+	precond.conv_kernel=NULL;
+	precond.conv_grid_to_dipole=NULL;
+	precond.conv_direct_edges=0;
+	precond.conv_direct_row_ptr=NULL;
+	precond.conv_direct_dipole=NULL;
+	precond.conv_direct_stencil=NULL;
+	precond.conv_direct=ShouldUseConvSAIDirect(n_stencil);
+	precond.conv_Phat=NULL;
+	precond.conv_work_in=NULL;
+	precond.conv_work_out=NULL;
+	precond.conv_plan_fwd=NULL;
+	precond.conv_plan_bwd=NULL;
+
+	if (precond.conv_direct) {
+		precond.conv_stencil=stencil_raw;
+		precond.conv_kernel=kernel_raw;
+		BuildConvSAIDirectMap();
+		BuildConvSAIDirectNeighbors();
+		if (IFROOT)
+			printf("ConvSAI preconditioner loaded: %zu stencil, direct sparse convolution, grid %zux%zux%zu\n",
+				n_stencil,gx,gy,gz);
+		return;
+	}
 
 	// Allocate frequency-domain kernel: 9 components × gridN
 	precond.conv_Phat=(doublecomplex *)voidVector(9*gridN*sizeof(doublecomplex),ALL_POS,"convsai Phat");
@@ -635,6 +678,7 @@ static void ApplyConvSAIDirect(const doublecomplex *in,doublecomplex *out,size_t
 }
 
 //======================================================================================================================
+
 static void ApplyConvSAI(const doublecomplex *in,doublecomplex *out,size_t n)
 /* Apply ConvSAI preconditioner via FFT convolution: out = M * in.
  *
@@ -1024,9 +1068,17 @@ void PrecondFree(void)
 			free(precond.poly_buf);
 		} else if (precond.mode==PRECOND_MODE_CONVSAI || precond.mode==PRECOND_MODE_FFTDIRECT) {
 #ifdef FFTW3
-			fftw_destroy_plan((fftw_plan)precond.conv_plan_fwd);
-			fftw_destroy_plan((fftw_plan)precond.conv_plan_bwd);
+			if (precond.conv_plan_fwd!=NULL)
+				fftw_destroy_plan((fftw_plan)precond.conv_plan_fwd);
+			if (precond.conv_plan_bwd!=NULL)
+				fftw_destroy_plan((fftw_plan)precond.conv_plan_bwd);
 #endif
+			free(precond.conv_stencil);
+			free(precond.conv_kernel);
+			free(precond.conv_grid_to_dipole);
+			free(precond.conv_direct_row_ptr);
+			free(precond.conv_direct_dipole);
+			free(precond.conv_direct_stencil);
 			free(precond.conv_Phat);
 			free(precond.conv_work_in);
 			free(precond.conv_work_out);

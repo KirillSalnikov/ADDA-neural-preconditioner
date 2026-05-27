@@ -9,8 +9,8 @@
  *   mode=1 (SAI): M is a general sparse matrix. Apply via SpMV: out = M * in.
  *   mode=2 (POLY): Polynomial preconditioner p(A)*v. K+1 complex coefficients, applied via
  *                   Horner's method using ADDA's own MatVec. Zero extra memory beyond coefficients.
- *   mode=3 (CONVSAI): Translation-invariant convolution kernel. Applied via FFT convolution:
- *                      scatter → FFT → multiply by kernel → IFFT → gather. Cost = O(N log N).
+ *   mode=3 (CONVSAI): Translation-invariant convolution kernel. Applied via FFT convolution for large kernels
+ *                      or direct sparse convolution for small kernels.
  *
  * The actual residual ||b - A*x|| / ||b|| is tracked algebraically using intermediate A*p and A*s
  * values (before M is applied), so no extra MatVec is needed per iteration.
@@ -50,9 +50,18 @@ typedef struct {
 	int poly_degree;            // K: polynomial degree
 	doublecomplex *poly_coeffs; // K+1 complex coefficients c_0...c_K
 	doublecomplex *poly_buf;    // temp buffer (size n) for Horner evaluation
-	/* CONVSAI mode: FFT convolution preconditioner */
+	/* CONVSAI mode: convolution preconditioner */
 	size_t conv_gx,conv_gy,conv_gz; // FFT grid dimensions (= 2*boxX, 2*boxY, 2*boxZ padded)
 	size_t conv_gridN;               // = conv_gx * conv_gy * conv_gz
+	bool conv_direct;                // use direct sparse convolution instead of FFT
+	size_t conv_n_stencil;           // number of stencil offsets for CONVSAI
+	int32_t *conv_stencil;           // direct mode: n_stencil * 3 displacement vectors
+	doublecomplex *conv_kernel;      // direct mode: n_stencil * 9 complex kernel blocks
+	int64_t *conv_grid_to_dipole;    // direct mode: grid index -> global dipole index, -1 for empty
+	size_t conv_direct_edges;        // direct mode: number of precomputed local neighbor entries
+	size_t *conv_direct_row_ptr;     // direct mode: local dipole -> neighbor entry range
+	uint64_t *conv_direct_dipole;    // direct mode: neighbor entry -> global dipole index
+	uint32_t *conv_direct_stencil;   // direct mode: neighbor entry -> stencil index
 	doublecomplex *conv_Phat;        // frequency-domain kernel: 9 * conv_gridN complex values
 	doublecomplex *conv_work_in;     // work buffer for input:  3 * conv_gridN
 	doublecomplex *conv_work_out;    // work buffer for output: 3 * conv_gridN

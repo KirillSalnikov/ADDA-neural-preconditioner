@@ -33,11 +33,17 @@
 // From fft.c — Dmatrix and its dimensions
 extern const doublecomplex * restrict Dmatrix;
 extern const size_t DsizeY,DsizeZ;
+#ifndef SPARSE
+extern doublecomplex * restrict Xmatrix,* restrict slices,* restrict slices_tr;
+#endif
 // From comm.c / vars.h
 extern size_t gridX,gridY,gridZ;
 
 bool use_precond=false;
 PrecondData precond;
+
+#define CONVSAI_DIRECT_DEFAULT_MAX_STENCIL 8192
+#define CONVSAI_DIRECT_PRECOMPUTE_DEFAULT_MB 256
 
 // MatVec from matvec.c — needed for POLY mode Horner evaluation
 void MatVec(doublecomplex * restrict in,doublecomplex * restrict out,double * inprod,bool her,
@@ -57,6 +63,198 @@ static void ReadComplexValues(FILE *f,doublecomplex *dest,size_t count,const cha
 	for (i=0;i<count;i++)
 		dest[i]=raw[2*i]+I*raw[2*i+1];
 	free(raw);
+}
+
+//======================================================================================================================
+
+static bool ParseBoolEnv(const char *value,bool *out)
+{
+	if (value==NULL || value[0]=='\0') return false;
+	if (strcmp(value,"1")==0 || strcmp(value,"true")==0 || strcmp(value,"TRUE")==0 ||
+	    strcmp(value,"yes")==0 || strcmp(value,"YES")==0 || strcmp(value,"on")==0 ||
+	    strcmp(value,"ON")==0) {
+		*out=true;
+		return true;
+	}
+	if (strcmp(value,"0")==0 || strcmp(value,"false")==0 || strcmp(value,"FALSE")==0 ||
+	    strcmp(value,"no")==0 || strcmp(value,"NO")==0 || strcmp(value,"off")==0 ||
+	    strcmp(value,"OFF")==0) {
+		*out=false;
+		return true;
+	}
+	return false;
+}
+
+static bool ShouldUseConvSAIDirect(size_t n_stencil)
+{
+	bool forced;
+	const char *env=getenv("ADDA_CONVSAI_DIRECT");
+	if (ParseBoolEnv(env,&forced)) return forced;
+
+	env=getenv("ADDA_CONVSAI_DIRECT_MAX_STENCIL");
+	if (env!=NULL && env[0]!='\0') {
+		char *endptr=NULL;
+		unsigned long max_stencil=strtoul(env,&endptr,10);
+		if (endptr!=env && *endptr=='\0')
+			return n_stencil<=(size_t)max_stencil;
+	}
+	return n_stencil<=CONVSAI_DIRECT_DEFAULT_MAX_STENCIL;
+}
+
+static bool ShouldPrecomputeConvSAIDirect(size_t n_stencil)
+{
+	bool forced;
+	const char *env=getenv("ADDA_CONVSAI_DIRECT_PRECOMPUTE");
+	if (ParseBoolEnv(env,&forced)) return forced;
+
+	size_t budget_mb=CONVSAI_DIRECT_PRECOMPUTE_DEFAULT_MB;
+	env=getenv("ADDA_CONVSAI_DIRECT_PRECOMPUTE_MB");
+	if (env!=NULL && env[0]!='\0') {
+		char *endptr=NULL;
+		unsigned long parsed=strtoul(env,&endptr,10);
+		if (endptr!=env && *endptr=='\0') budget_mb=(size_t)parsed;
+	}
+
+	long double bytes=(long double)local_nvoid_Ndip*(long double)n_stencil*
+		(long double)(sizeof(uint64_t)+sizeof(uint32_t));
+	bytes+=(long double)(local_nvoid_Ndip+1)*sizeof(size_t);
+	return bytes<=(long double)budget_mb*1024.0L*1024.0L;
+}
+
+static bool ShouldUseConvSAIDistributed(void)
+{
+	bool forced;
+	const char *env=getenv("ADDA_CONVSAI_DISTRIBUTED");
+	if (ParseBoolEnv(env,&forced)) return forced;
+#ifdef PARALLEL
+	return true;
+#else
+	return false;
+#endif
+}
+
+static size_t WrapConvCoord(long long value,size_t dim)
+{
+	long long d=(long long)dim;
+	long long r=value%d;
+	if (r<0) r+=d;
+	return (size_t)r;
+}
+
+static size_t ConvGridIndex(size_t x,size_t y,size_t z)
+{
+	return z*precond.conv_gy*precond.conv_gx+y*precond.conv_gx+x;
+}
+
+static int64_t ConvSAIDirectNeighborAt(int px,int py,int pz,size_t stencil_id)
+{
+	size_t qx=WrapConvCoord((long long)px-(long long)precond.conv_stencil[3*stencil_id+0],precond.conv_gx);
+	size_t qy=WrapConvCoord((long long)py-(long long)precond.conv_stencil[3*stencil_id+1],precond.conv_gy);
+	size_t qz=WrapConvCoord((long long)pz-(long long)precond.conv_stencil[3*stencil_id+2],precond.conv_gz);
+	return precond.conv_grid_to_dipole[ConvGridIndex(qx,qy,qz)];
+}
+
+static void BuildConvSAIDirectMap(void)
+{
+	size_t i,grid_idx;
+	int *pos_global;
+	precond.conv_grid_to_dipole=(int64_t *)voidVector(
+		precond.conv_gridN*sizeof(int64_t),ALL_POS,"convsai grid-to-dipole map");
+	for (i=0;i<precond.conv_gridN;i++) precond.conv_grid_to_dipole[i]=-1;
+
+#ifdef PARALLEL
+	{
+		size_t local_len=3*local_nvoid_Ndip;
+		int *pos_local=(int *)voidVector((local_len ? local_len : 1)*sizeof(int),ALL_POS,
+			"convsai local positions");
+		size_t j;
+		for (j=0;j<local_nvoid_Ndip;j++) {
+			pos_local[3*j+0]=(int)position[3*j+0];
+			pos_local[3*j+1]=(int)position[3*j+1];
+			pos_local[3*j+2]=(int)position[3*j+2]+local_z0;
+		}
+		pos_global=(int *)voidVector(3*nvoid_Ndip*sizeof(int),ALL_POS,"convsai global positions");
+		AllGather(pos_local,pos_global,int3_type,NULL);
+		free(pos_local);
+	}
+#else
+	pos_global=(int *)voidVector(3*nvoid_Ndip*sizeof(int),ALL_POS,"convsai global positions");
+	for (i=0;i<nvoid_Ndip;i++) {
+		pos_global[3*i+0]=(int)position[3*i+0];
+		pos_global[3*i+1]=(int)position[3*i+1];
+		pos_global[3*i+2]=(int)position[3*i+2];
+	}
+#endif
+
+	for (i=0;i<nvoid_Ndip;i++) {
+		int px=pos_global[3*i+0];
+		int py=pos_global[3*i+1];
+		int pz=pos_global[3*i+2];
+		if (px<0 || py<0 || pz<0 ||
+		    (size_t)px>=precond.conv_gx || (size_t)py>=precond.conv_gy || (size_t)pz>=precond.conv_gz)
+			LogError(ALL_POS,"Particle position (%d,%d,%d) is outside ConvSAI grid %zux%zux%zu",
+				px,py,pz,precond.conv_gx,precond.conv_gy,precond.conv_gz);
+		grid_idx=ConvGridIndex((size_t)px,(size_t)py,(size_t)pz);
+		precond.conv_grid_to_dipole[grid_idx]=(int64_t)i;
+	}
+	free(pos_global);
+}
+
+static void BuildConvSAIDirectNeighbors(void)
+{
+	size_t i,s,total,entry;
+
+	precond.conv_direct_edges=0;
+	precond.conv_direct_row_ptr=NULL;
+	precond.conv_direct_dipole=NULL;
+	precond.conv_direct_stencil=NULL;
+
+	if (!ShouldPrecomputeConvSAIDirect(precond.conv_n_stencil)) return;
+
+	precond.conv_direct_row_ptr=(size_t *)voidVector(
+		(local_nvoid_Ndip+1)*sizeof(size_t),ALL_POS,"convsai direct row_ptr");
+
+	total=0;
+	precond.conv_direct_row_ptr[0]=0;
+	for (i=0;i<local_nvoid_Ndip;i++) {
+		int px=position[3*i+0];
+		int py=position[3*i+1];
+		int pz=position[3*i+2];
+#ifdef PARALLEL
+		pz+=local_z0;
+#endif
+		for (s=0;s<precond.conv_n_stencil;s++)
+			if (ConvSAIDirectNeighborAt(px,py,pz,s)>=0) total++;
+		precond.conv_direct_row_ptr[i+1]=total;
+	}
+
+	precond.conv_direct_edges=total;
+	precond.conv_direct_dipole=(uint64_t *)voidVector(
+		(total ? total : 1)*sizeof(uint64_t),ALL_POS,"convsai direct dipoles");
+	precond.conv_direct_stencil=(uint32_t *)voidVector(
+		(total ? total : 1)*sizeof(uint32_t),ALL_POS,"convsai direct stencils");
+
+	entry=0;
+	for (i=0;i<local_nvoid_Ndip;i++) {
+		int px=position[3*i+0];
+		int py=position[3*i+1];
+		int pz=position[3*i+2];
+#ifdef PARALLEL
+		pz+=local_z0;
+#endif
+		for (s=0;s<precond.conv_n_stencil;s++) {
+			int64_t dip=ConvSAIDirectNeighborAt(px,py,pz,s);
+			if (dip>=0) {
+				precond.conv_direct_dipole[entry]=(uint64_t)dip;
+				precond.conv_direct_stencil[entry]=(uint32_t)s;
+				entry++;
+			}
+		}
+	}
+
+	if (IFROOT)
+		printf("ConvSAI direct neighbor cache: %zu local entries (%.1f avg per local dipole)\n",
+			total,local_nvoid_Ndip ? (double)total/(double)local_nvoid_Ndip : 0.0);
 }
 
 //======================================================================================================================
@@ -112,7 +310,7 @@ static void LoadILU(FILE *f,const char *filename)
 static void LoadFFTDirect(FILE *f,const char *filename)
 /* Load FFT-direct preconditioner: Phat stored as 9*gridN complex values.
  * Format: header (mode=4), then gx(u64), gy(u64), gz(u64), then 9*gx*gy*gz interleaved doubles.
- * Reuses CONVSAI apply infrastructure (same Phat layout, same FFT plans).
+ * Reuses CONVSAI apply infrastructure (same Phat layout).
  */
 {
 #ifndef FFTW3
@@ -129,11 +327,11 @@ static void LoadFFTDirect(FILE *f,const char *filename)
 	gz=(size_t)dims[2];
 	gridN=gx*gy*gz;
 
-	/* Verify grid matches ADDA's box (Phat must match the problem) */
+	/* Verify grid matches ADDA's actual FFT grid, including MPI divisibility constraints. */
 	{
-		size_t adda_gx=(size_t)fftFit(2*(int)boxX,1);
-		size_t adda_gy=(size_t)fftFit(2*(int)boxY,1);
-		size_t adda_gz=(size_t)fftFit(2*(int)boxZ,1);
+		size_t adda_gx=gridX;
+		size_t adda_gy=gridY;
+		size_t adda_gz=gridZ;
 		if (gx!=adda_gx || gy!=adda_gy || gz!=adda_gz)
 			LogError(ONE_POS,"FFTDIRECT grid %zux%zux%zu != ADDA grid %zux%zux%zu in '%s'",
 				gx,gy,gz,adda_gx,adda_gy,adda_gz,filename);
@@ -143,29 +341,46 @@ static void LoadFFTDirect(FILE *f,const char *filename)
 	precond.conv_gy=gy;
 	precond.conv_gz=gz;
 	precond.conv_gridN=gridN;
+	precond.conv_direct=false;
+	precond.conv_n_stencil=0;
+	precond.conv_stencil=NULL;
+	precond.conv_kernel=NULL;
+	precond.conv_grid_to_dipole=NULL;
+	precond.conv_direct_edges=0;
+	precond.conv_direct_row_ptr=NULL;
+	precond.conv_direct_dipole=NULL;
+	precond.conv_direct_stencil=NULL;
+	precond.conv_Phat=NULL;
+	precond.conv_work_in=NULL;
+	precond.conv_work_out=NULL;
+	precond.conv_plan_fwd=NULL;
+	precond.conv_plan_bwd=NULL;
 
 	/* Allocate Phat and read directly */
 	precond.conv_Phat=(doublecomplex *)voidVector(9*gridN*sizeof(doublecomplex),ALL_POS,"fftdirect Phat");
 	ReadComplexValues(f,precond.conv_Phat,9*gridN,filename,"FFTDIRECT Phat");
 
-	/* Allocate work buffers */
-	precond.conv_work_in=(doublecomplex *)voidVector(3*gridN*sizeof(doublecomplex),ALL_POS,"fftdirect work_in");
-	precond.conv_work_out=(doublecomplex *)voidVector(3*gridN*sizeof(doublecomplex),ALL_POS,"fftdirect work_out");
+	if (!ShouldUseConvSAIDistributed()) {
+		/* Allocate work buffers for the replicated FFT fallback. */
+		precond.conv_work_in=(doublecomplex *)voidVector(3*gridN*sizeof(doublecomplex),ALL_POS,"fftdirect work_in");
+		precond.conv_work_out=(doublecomplex *)voidVector(3*gridN*sizeof(doublecomplex),ALL_POS,"fftdirect work_out");
 
-	/* Create FFTW plans */
-	precond.conv_plan_fwd=(void *)fftw_plan_dft_3d(
-		(int)gz,(int)gy,(int)gx,
-		(fftw_complex *)precond.conv_work_in,
-		(fftw_complex *)precond.conv_work_in,
-		FFTW_FORWARD,FFTW_MEASURE);
-	precond.conv_plan_bwd=(void *)fftw_plan_dft_3d(
-		(int)gz,(int)gy,(int)gx,
-		(fftw_complex *)precond.conv_work_out,
-		(fftw_complex *)precond.conv_work_out,
-		FFTW_BACKWARD,FFTW_MEASURE);
+		/* Create FFTW plans for the replicated FFT fallback. */
+		precond.conv_plan_fwd=(void *)fftw_plan_dft_3d(
+			(int)gz,(int)gy,(int)gx,
+			(fftw_complex *)precond.conv_work_in,
+			(fftw_complex *)precond.conv_work_in,
+			FFTW_FORWARD,FFTW_MEASURE);
+		precond.conv_plan_bwd=(void *)fftw_plan_dft_3d(
+			(int)gz,(int)gy,(int)gx,
+			(fftw_complex *)precond.conv_work_out,
+			(fftw_complex *)precond.conv_work_out,
+			FFTW_BACKWARD,FFTW_MEASURE);
+	}
 
-	printf("FFTDIRECT preconditioner loaded: grid %zux%zux%zu, %zu Phat values\n",
-		gx,gy,gz,9*gridN);
+	if (IFROOT)
+		printf("FFTDIRECT preconditioner loaded: grid %zux%zux%zu, %zu Phat values%s\n",
+			gx,gy,gz,9*gridN,ShouldUseConvSAIDistributed() ? ", distributed MPI apply" : "");
 #endif
 }
 
@@ -196,39 +411,53 @@ static void LoadConvSAI(FILE *f,const char *filename)
 	kernel_raw=(doublecomplex *)voidVector(n_stencil*9*sizeof(doublecomplex),ALL_POS,"convsai kernel");
 	ReadComplexValues(f,kernel_raw,n_stencil*9,filename,"CONVSAI kernel");
 
-	// Determine FFT grid: use ADDA's fftFit for FFTW3-optimal sizes (products of 2,3,5,7)
-	gx=(size_t)fftFit(2*(int)boxX,1);
-	gy=(size_t)fftFit(2*(int)boxY,1);
-	gz=(size_t)fftFit(2*(int)boxZ,1);
+	// Use ADDA's actual FFT grid, including MPI divisibility constraints.
+	gx=gridX;
+	gy=gridY;
+	gz=gridZ;
 	gridN=gx*gy*gz;
 	precond.conv_gx=gx;
 	precond.conv_gy=gy;
 	precond.conv_gz=gz;
 	precond.conv_gridN=gridN;
+	precond.conv_n_stencil=n_stencil;
+	precond.conv_stencil=NULL;
+	precond.conv_kernel=NULL;
+	precond.conv_grid_to_dipole=NULL;
+	precond.conv_direct_edges=0;
+	precond.conv_direct_row_ptr=NULL;
+	precond.conv_direct_dipole=NULL;
+	precond.conv_direct_stencil=NULL;
+	precond.conv_direct=ShouldUseConvSAIDirect(n_stencil);
+	precond.conv_Phat=NULL;
+	precond.conv_work_in=NULL;
+	precond.conv_work_out=NULL;
+	precond.conv_plan_fwd=NULL;
+	precond.conv_plan_bwd=NULL;
+
+	if (precond.conv_direct) {
+		precond.conv_stencil=stencil_raw;
+		precond.conv_kernel=kernel_raw;
+		BuildConvSAIDirectMap();
+		BuildConvSAIDirectNeighbors();
+		if (IFROOT)
+			printf("ConvSAI preconditioner loaded: %zu stencil, direct sparse convolution, grid %zux%zux%zu\n",
+				n_stencil,gx,gy,gz);
+		return;
+	}
 
 	// Allocate frequency-domain kernel: 9 components × gridN
 	precond.conv_Phat=(doublecomplex *)voidVector(9*gridN*sizeof(doublecomplex),ALL_POS,"convsai Phat");
-
-	// Allocate work buffers: 3 components × gridN each
-	precond.conv_work_in=(doublecomplex *)voidVector(3*gridN*sizeof(doublecomplex),ALL_POS,"convsai work_in");
-	precond.conv_work_out=(doublecomplex *)voidVector(3*gridN*sizeof(doublecomplex),ALL_POS,"convsai work_out");
-
-	// Create FFTW plans (in-place, for each component) using FFTW_MEASURE for fast execution
-	precond.conv_plan_fwd=(void *)fftw_plan_dft_3d(
-		(int)gz,(int)gy,(int)gx,
-		(fftw_complex *)precond.conv_work_in,
-		(fftw_complex *)precond.conv_work_in,
-		FFTW_FORWARD,FFTW_MEASURE);
-	precond.conv_plan_bwd=(void *)fftw_plan_dft_3d(
-		(int)gz,(int)gy,(int)gx,
-		(fftw_complex *)precond.conv_work_out,
-		(fftw_complex *)precond.conv_work_out,
-		FFTW_BACKWARD,FFTW_MEASURE);
 
 	// Build spatial kernel and FFT to get Phat
 	// For each (a,b) pair (9 total): place kernel blocks on grid, then FFT
 	{
 		doublecomplex *spatial=(doublecomplex *)voidVector(gridN*sizeof(doublecomplex),ALL_POS,"convsai spatial");
+		void *build_plan=(void *)fftw_plan_dft_3d(
+			(int)gz,(int)gy,(int)gx,
+			(fftw_complex *)spatial,
+			(fftw_complex *)spatial,
+			FFTW_FORWARD,FFTW_MEASURE);
 
 		for (a=0;a<3;a++) for (b=0;b<3;b++) {
 			// Zero out spatial grid
@@ -247,22 +476,205 @@ static void LoadConvSAI(FILE *f,const char *filename)
 			}
 
 			// FFT spatial → frequency domain
-			fftw_execute_dft((fftw_plan)precond.conv_plan_fwd,
-				(fftw_complex *)spatial,(fftw_complex *)spatial);
+			fftw_execute((fftw_plan)build_plan);
 
 			// Store in Phat: component (a,b) at offset (3*a+b)*gridN
 			memcpy(precond.conv_Phat+(3*a+b)*gridN,spatial,gridN*sizeof(doublecomplex));
 		}
 
+		fftw_destroy_plan((fftw_plan)build_plan);
 		free(spatial);
 	}
 
 	free(stencil_raw);
 	free(kernel_raw);
 
-	printf("ConvSAI preconditioner loaded: %zu stencil, FFT grid %zux%zux%zu\n",
-		n_stencil,gx,gy,gz);
+	if (!ShouldUseConvSAIDistributed()) {
+		// Allocate work buffers and plans for the replicated FFT fallback.
+		precond.conv_work_in=(doublecomplex *)voidVector(3*gridN*sizeof(doublecomplex),ALL_POS,"convsai work_in");
+		precond.conv_work_out=(doublecomplex *)voidVector(3*gridN*sizeof(doublecomplex),ALL_POS,"convsai work_out");
+		precond.conv_plan_fwd=(void *)fftw_plan_dft_3d(
+			(int)gz,(int)gy,(int)gx,
+			(fftw_complex *)precond.conv_work_in,
+			(fftw_complex *)precond.conv_work_in,
+			FFTW_FORWARD,FFTW_MEASURE);
+		precond.conv_plan_bwd=(void *)fftw_plan_dft_3d(
+			(int)gz,(int)gy,(int)gx,
+			(fftw_complex *)precond.conv_work_out,
+			(fftw_complex *)precond.conv_work_out,
+			FFTW_BACKWARD,FFTW_MEASURE);
+	}
+
+	if (IFROOT)
+		printf("ConvSAI preconditioner loaded: %zu stencil, FFT grid %zux%zux%zu%s\n",
+			n_stencil,gx,gy,gz,ShouldUseConvSAIDistributed() ? ", distributed MPI apply" : "");
 #endif // FFTW3
+}
+
+//======================================================================================================================
+
+#if defined(PARALLEL) && !defined(SPARSE)
+static inline size_t PrecondIndexSliceYZ(const size_t y,const size_t z)
+{
+	return y*gridZ+z;
+}
+
+static inline size_t PrecondIndexSliceZY(const size_t y,const size_t z)
+{
+	return z*gridY+y;
+}
+
+static inline size_t PrecondIndexGarbledX(const size_t x,const size_t y,const size_t z)
+{
+	return ((z%local_Nz)*smallY+y)*gridX+(z/local_Nz)*local_Nx+x%local_Nx;
+}
+
+static inline size_t PrecondIndexXmatrix(const size_t x,const size_t y,const size_t z)
+{
+	return (z*smallY+y)*gridX+x;
+}
+
+static void ApplyConvSAIDistributedFFT(const doublecomplex *in,doublecomplex *out,size_t n)
+/* MPI ConvSAI apply using ADDA's distributed FFT layout.
+ *
+ * The old MPI path gathered a full grid on every rank, then every rank performed
+ * the complete 3D FFT and dense 3x3 frequency multiply. This function follows
+ * MatVec's decomposition instead: z-slab input, FFT-X, BlockTranspose to x-slabs,
+ * local Y/Z FFTs and local frequency multiply, then the inverse path.
+ */
+{
+	size_t i,x,y,z,comp,a,b,k;
+	size_t ndip=n/3;
+	size_t gridN=precond.conv_gridN;
+	double inv_gridN=1.0/(double)gridN;
+
+	for (i=0;i<3*local_Nsmall;i++) Xmatrix[i]=0.0;
+
+	for (i=0;i<ndip;i++) {
+		size_t j=3*i;
+		size_t idx=PrecondIndexXmatrix(position[j],position[j+1],position[j+2]);
+		for (comp=0;comp<3;comp++)
+			Xmatrix[idx+comp*local_Nsmall]=in[j+comp];
+	}
+
+	fftX(FFT_FORWARD);
+	BlockTranspose(Xmatrix,NULL);
+
+	for (x=local_x0;x<local_x1;x++) {
+		for (i=0;i<3*gridYZ;i++) slices[i]=0.0;
+
+		for (y=0;y<(size_t)boxY;y++) for (z=0;z<(size_t)boxZ;z++) {
+			size_t src=PrecondIndexGarbledX(x,y,z);
+			size_t dst=PrecondIndexSliceYZ(y,z);
+			for (comp=0;comp<3;comp++)
+				slices[dst+comp*gridYZ]=Xmatrix[src+comp*local_Nsmall];
+		}
+
+		fftZ(FFT_FORWARD);
+		TransposeYZ(FFT_FORWARD);
+		fftY(FFT_FORWARD);
+
+		for (z=0;z<gridZ;z++) for (y=0;y<gridY;y++) {
+			size_t yz=PrecondIndexSliceZY(y,z);
+			size_t xyz=(z*gridY+y)*gridX+x;
+			doublecomplex in0=slices_tr[yz+0*gridYZ];
+			doublecomplex in1=slices_tr[yz+1*gridYZ];
+			doublecomplex in2=slices_tr[yz+2*gridYZ];
+			doublecomplex outv[3];
+
+			for (a=0;a<3;a++) {
+				k=(3*a+0)*gridN+xyz;
+				outv[a]=precond.conv_Phat[k]*in0;
+				k=(3*a+1)*gridN+xyz;
+				outv[a]+=precond.conv_Phat[k]*in1;
+				k=(3*a+2)*gridN+xyz;
+				outv[a]+=precond.conv_Phat[k]*in2;
+			}
+			for (b=0;b<3;b++)
+				slices_tr[yz+b*gridYZ]=outv[b];
+		}
+
+		fftY(FFT_BACKWARD);
+		TransposeYZ(FFT_BACKWARD);
+		fftZ(FFT_BACKWARD);
+
+		for (y=0;y<(size_t)boxY;y++) for (z=0;z<(size_t)boxZ;z++) {
+			size_t src=PrecondIndexSliceYZ(y,z);
+			size_t dst=PrecondIndexGarbledX(x,y,z);
+			for (comp=0;comp<3;comp++)
+				Xmatrix[dst+comp*local_Nsmall]=slices[src+comp*gridYZ];
+		}
+	}
+
+	BlockTranspose(Xmatrix,NULL);
+	fftX(FFT_BACKWARD);
+
+	for (i=0;i<ndip;i++) {
+		size_t j=3*i;
+		size_t idx=PrecondIndexXmatrix(position[j],position[j+1],position[j+2]);
+		for (comp=0;comp<3;comp++)
+			out[j+comp]=Xmatrix[idx+comp*local_Nsmall]*inv_gridN;
+	}
+}
+#endif
+
+//======================================================================================================================
+
+static void ApplyConvSAIDirect(const doublecomplex *in,doublecomplex *out,size_t n)
+/* Apply ConvSAI by direct sparse convolution over the stored stencil.
+ * This path is intended for threshold-pruned kernels where n_stencil is small
+ * enough that O(N*n_stencil) beats redundant full-grid FFTs in MPI mode.
+ */
+{
+	const doublecomplex *in_full;
+	size_t gx=precond.conv_gx;
+	size_t gy=precond.conv_gy;
+	size_t gz=precond.conv_gz;
+	const int32_t *stencil=precond.conv_stencil;
+	const doublecomplex *kernel=precond.conv_kernel;
+	const int64_t *grid_to_dipole=precond.conv_grid_to_dipole;
+	size_t ndip=n/3;
+	size_t i,s;
+
+#ifdef PARALLEL
+	AllGather((void *)in,precond.gather_buf,cmplx3_type,NULL);
+	in_full=precond.gather_buf;
+#else
+	in_full=in;
+#endif
+
+	for (i=0;i<ndip;i++) {
+		int px=position[3*i+0];
+		int py=position[3*i+1];
+		int pz=position[3*i+2];
+		doublecomplex out0=0,out1=0,out2=0;
+#ifdef PARALLEL
+		pz+=local_z0;
+#endif
+		if (precond.conv_direct_row_ptr!=NULL) {
+			size_t e;
+			for (e=precond.conv_direct_row_ptr[i];e<precond.conv_direct_row_ptr[i+1];e++) {
+				const doublecomplex *x=in_full+3*(size_t)precond.conv_direct_dipole[e];
+				const doublecomplex *K=kernel+9*(size_t)precond.conv_direct_stencil[e];
+				out0+=K[0]*x[0]+K[1]*x[1]+K[2]*x[2];
+				out1+=K[3]*x[0]+K[4]*x[1]+K[5]*x[2];
+				out2+=K[6]*x[0]+K[7]*x[1]+K[8]*x[2];
+			}
+		}
+		else for (s=0;s<precond.conv_n_stencil;s++) {
+			int64_t dip=ConvSAIDirectNeighborAt(px,py,pz,s);
+			if (dip>=0) {
+				const doublecomplex *x=in_full+3*(size_t)dip;
+				const doublecomplex *K=kernel+9*s;
+				out0+=K[0]*x[0]+K[1]*x[1]+K[2]*x[2];
+				out1+=K[3]*x[0]+K[4]*x[1]+K[5]*x[2];
+				out2+=K[6]*x[0]+K[7]*x[1]+K[8]*x[2];
+			}
+		}
+		out[3*i+0]=out0;
+		out[3*i+1]=out1;
+		out[3*i+2]=out2;
+	}
 }
 
 //======================================================================================================================
@@ -270,15 +682,37 @@ static void LoadConvSAI(FILE *f,const char *filename)
 static void ApplyConvSAI(const doublecomplex *in,doublecomplex *out,size_t n)
 /* Apply ConvSAI preconditioner via FFT convolution: out = M * in.
  *
- * Steps:
+ * Sequential mode:
  *   1. Scatter input dipole vectors onto 3D grid (3 components)
  *   2. FFT forward (3 independent 3D FFTs)
  *   3. Frequency-domain 3×3 matrix multiply with Phat
  *   4. FFT backward (3 independent 3D FFTs)
  *   5. Gather output from grid at dipole positions
  *   6. Normalize by 1/gridN
+ *
+ * MPI parallel mode:
+ *   Same algorithm, but each rank scatters only its local dipoles onto the full 3D grid,
+ *   then MPI_Allreduce (sum) combines all contributions. Each rank then independently
+ *   performs FFT + multiply + IFFT, and gathers only its local dipole outputs.
+ *   This is redundant in compute but simple and correct. The FFT cost O(N log N) is
+ *   typically small compared to MatVec communication overhead.
+ *
+ *   In MPI mode, position[] is local with Z-coordinates relative to local_z0,
+ *   so we add local_z0 back when computing grid indices.
  */
 {
+	if (precond.conv_direct) {
+		ApplyConvSAIDirect(in,out,n);
+		return;
+	}
+
+#if defined(PARALLEL) && !defined(SPARSE)
+	if (ShouldUseConvSAIDistributed()) {
+		ApplyConvSAIDistributedFFT(in,out,n);
+		return;
+	}
+#endif
+
 #ifdef FFTW3
 	size_t gx=precond.conv_gx;
 	size_t gy=precond.conv_gy;
@@ -298,14 +732,23 @@ static void ApplyConvSAI(const doublecomplex *in,doublecomplex *out,size_t n)
 	memset(work_in,0,3*gridN*sizeof(doublecomplex));
 
 	// 2. Scatter: place dipole vectors onto grid
+	// In MPI mode, position[].z is relative to local_z0; add offset back for global grid index
 	for (i=0;i<ndip;i++) {
 		px=position[3*i+0];
 		py=position[3*i+1];
 		pz=position[3*i+2];
+#ifdef PARALLEL
+		pz+=local_z0;
+#endif
 		grid_idx=(size_t)pz*gy*gx+(size_t)py*gx+(size_t)px;
 		for (comp=0;comp<3;comp++)
 			work_in[comp*gridN+grid_idx]=in[3*i+comp];
 	}
+
+#ifdef PARALLEL
+	// 2b. MPI: sum scatter contributions from all ranks onto all ranks
+	MyInnerProduct(work_in,cmplx_type,3*gridN,NULL);
+#endif
 
 	// 3. FFT forward: 3 independent transforms
 	for (comp=0;comp<3;comp++)
@@ -341,6 +784,9 @@ static void ApplyConvSAI(const doublecomplex *in,doublecomplex *out,size_t n)
 		px=position[3*i+0];
 		py=position[3*i+1];
 		pz=position[3*i+2];
+#ifdef PARALLEL
+		pz+=local_z0;
+#endif
 		grid_idx=(size_t)pz*gy*gx+(size_t)py*gx+(size_t)px;
 		for (comp=0;comp<3;comp++)
 			out[3*i+comp]=work_out[comp*gridN+grid_idx]*inv_gridN;
@@ -535,13 +981,15 @@ static void PolyHorner(const doublecomplex *in,doublecomplex *out,size_t n)
 
 void PrecondApply(const doublecomplex *in,doublecomplex *out,size_t n)
 /* Apply preconditioner: out = M * in
- * SAI mode:  out = M * in (sparse matrix-vector product)
- * ILU mode:  solve L*z = in, then U*out = z (forward + backward substitution)
- * POLY mode: out = p(A) * in via Horner's method (K calls to MatVec)
+ * SAI mode:    out = M * in (sparse matrix-vector product)
+ * ILU mode:    solve L*z = in, then U*out = z (forward + backward substitution)
+ * POLY mode:   out = p(A) * in via Horner's method (K calls to MatVec)
+ * CONVSAI/FFT: out = M * in via FFT convolution (scatter + FFT + multiply + IFFT + gather)
  *
  * In MPI parallel mode, 'in' and 'out' are local vectors (size n = local_nRows).
- * The full input vector is gathered via AllGather before SpMV, which then computes
- * only the local rows of the result.
+ * SAI mode:    AllGather full input, SpMV on local rows only.
+ * CONVSAI/FFT: By default uses ADDA's distributed FFT decomposition. Set
+ *              ADDA_CONVSAI_DISTRIBUTED=0 to use the old replicated full-grid FFT fallback.
  */
 {
 	if (precond.mode==PRECOND_MODE_SAI) {
@@ -620,9 +1068,17 @@ void PrecondFree(void)
 			free(precond.poly_buf);
 		} else if (precond.mode==PRECOND_MODE_CONVSAI || precond.mode==PRECOND_MODE_FFTDIRECT) {
 #ifdef FFTW3
-			fftw_destroy_plan((fftw_plan)precond.conv_plan_fwd);
-			fftw_destroy_plan((fftw_plan)precond.conv_plan_bwd);
+			if (precond.conv_plan_fwd!=NULL)
+				fftw_destroy_plan((fftw_plan)precond.conv_plan_fwd);
+			if (precond.conv_plan_bwd!=NULL)
+				fftw_destroy_plan((fftw_plan)precond.conv_plan_bwd);
 #endif
+			free(precond.conv_stencil);
+			free(precond.conv_kernel);
+			free(precond.conv_grid_to_dipole);
+			free(precond.conv_direct_row_ptr);
+			free(precond.conv_direct_dipole);
+			free(precond.conv_direct_stencil);
 			free(precond.conv_Phat);
 			free(precond.conv_work_in);
 			free(precond.conv_work_out);
