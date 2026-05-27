@@ -21,7 +21,10 @@ import torch
 try:
     from data import matrix_to_graph_complex
 except ImportError:
-    from apps.data import matrix_to_graph_complex
+    try:
+        from apps.data import matrix_to_graph_complex
+    except ImportError:
+        matrix_to_graph_complex = None
 
 
 def make_sphere_dipoles(grid_size):
@@ -382,6 +385,10 @@ def generate_adda_problems(output_dir, configs):
         b = b / np.linalg.norm(b)
 
         # Save as PyG graph
+        if matrix_to_graph_complex is None:
+            raise ImportError(
+                "apps.data is unavailable; cannot convert matrices to PyG graphs"
+            )
         graph = matrix_to_graph_complex(A, b)
         name = f"{n}_{idx}"
         torch.save(graph, os.path.join(output_dir, f"{name}.pt"))

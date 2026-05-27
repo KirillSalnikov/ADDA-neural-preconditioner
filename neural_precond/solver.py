@@ -19,7 +19,10 @@ import numpy as np
 
 from core.fft_matvec import FFTMatVec
 from krylov.bicgstab import bicgstab
-from apps.generate_sai_dataset import build_sai_graph
+try:
+    from apps.generate_sai_dataset import build_sai_graph
+except ImportError:
+    build_sai_graph = None
 from neural_precond.model import PolyPrecond
 
 
@@ -87,6 +90,10 @@ class PolyPrecondSolver:
         )
 
         # Build graph and encode geometry → polynomial coefficients
+        if build_sai_graph is None:
+            raise ImportError(
+                "apps.generate_sai_dataset is unavailable; PolyPrecondSolver cannot build the graph"
+            )
         data = build_sai_graph(positions, k, m, d)
         data.x = data.x.float()
         data.edge_attr = data.edge_attr.float()
