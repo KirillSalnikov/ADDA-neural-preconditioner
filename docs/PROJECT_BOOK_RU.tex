@@ -1,0 +1,1236 @@
+\documentclass[11pt,a4paper,oneside]{book}
+
+\usepackage{fontspec}
+\usepackage{polyglossia}
+\setmainlanguage{russian}
+\setotherlanguage{english}
+\setmainfont{DejaVu Serif}
+\setsansfont{DejaVu Sans}
+\setmonofont{DejaVu Sans Mono}
+
+\usepackage[a4paper,margin=24mm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{array,booktabs,longtable}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{enumitem}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!45!black,
+  urlcolor=blue!45!black,
+  pdftitle={ADDA Neural Preconditioner: техническая книга проекта},
+  pdfauthor={Project notes}
+}
+
+\lstdefinestyle{code}{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  framerule=0.3pt,
+  rulecolor=\color{black!25},
+  backgroundcolor=\color{black!3},
+  xleftmargin=1em,
+  xrightmargin=1em
+}
+\lstset{style=code}
+
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\file}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\term}[1]{\textbf{#1}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\C}{\mathbb{C}}
+
+\title{
+  \Huge ADDA Neural Preconditioner\\
+  \Large техническая книга проекта
+}
+\author{Состояние рабочей копии: \code{convsai-universal}}
+\date{1 июня 2026}
+
+\begin{document}
+\frontmatter
+\maketitle
+\tableofcontents
+
+\chapter*{Зачем нужен этот документ}
+\addcontentsline{toc}{chapter}{Зачем нужен этот документ}
+
+В этом проекте смешаны три уровня сложности: численный метод DDA, модификация
+ADDA на C и нейросетевое обучение предобуславливателя. Если смотреть только на
+логи обучения, легко сделать неверный вывод: \emph{loss стал лучше, значит
+ADDA ускорится}. На практике это не так. Модель может уменьшать внутренний
+training loss и одновременно делать реальный расчёт медленнее.
+
+Цель этой книги --- дать не поверхностную карту файлов, а рабочую модель
+понимания:
+
+\begin{itemize}[leftmargin=2em]
+  \item что именно решает ADDA;
+  \item что такое предобуславливатель и почему он может ускорять или замедлять;
+  \item чем отличаются ConvSAI/K2 и Spectral ConvSAI;
+  \item как устроены входы, выходы, loss-функции и экспорт;
+  \item как читать логи, heatmap и wall-time метрики;
+  \item почему последние ConvSAI/K2 fine-tune попытки были подозрительными;
+  \item какой порядок действий нужен, чтобы честно доказать полезность модели.
+\end{itemize}
+
+\mainmatter
+
+\chapter{Короткая картина проекта}
+
+\section{Что мы ускоряем}
+
+ADDA решает систему линейных уравнений, возникающую в DDA
+(\foreignlanguage{english}{Discrete Dipole Approximation}):
+
+\begin{equation}
+  A x = b,
+\end{equation}
+
+где $A$ --- большая комплексная матрица взаимодействия диполей, $x$ ---
+неизвестные дипольные поляризации, $b$ --- правая часть, задаваемая падающей
+электромагнитной волной. Матрица не формируется как плотная матрица; её
+применение реализуется через FFT.
+
+Главная цена расчёта --- итерационный решатель. В проекте чаще всего
+используется \code{BiCGStab}, а для некоторых больших preconditioner-heavy
+случаев тестируется \code{FGMRES}. Если без предобуславливателя нужно сотни
+или тысячи итераций, хороший предобуславливатель может уменьшить это число в
+разы или десятки раз.
+
+\section{Что такое нейросетевой предобуславливатель}
+
+Предобуславливатель --- оператор $M$, который должен примерно вести себя как
+$A^{-1}$. Вместо исходной системы решатель работает с более удобной системой:
+
+\begin{equation}
+  M A x = M b.
+\end{equation}
+
+Если $M A \approx I$, спектр системы становится лучше, и Krylov-решатель
+сходится быстрее. Но $M$ сам стоит денег: его надо импортировать, хранить и
+применять на каждом шаге. Поэтому реальная цель:
+
+\begin{equation}
+  T_{\mathrm{precond}} < T_{\mathrm{baseline}},
+\end{equation}
+
+а не просто меньшее число итераций или красивый loss.
+
+\section{Две ветки}
+
+Проект разделён на две независимые ветки.
+
+\begin{description}[leftmargin=3.5cm,style=nextline]
+  \item[\code{convsai-universal}]
+  Текущая рабочая копия. Содержит ConvSAI Universal, также называемый K2 или
+  K$^2$ v3. Это пространственный свёрточный предобуславливатель.
+
+  \item[\code{spectral-convsai}]
+  Отдельная ветка со Spectral ConvSAI. Она предсказывает предобуславливатель
+  прямо в частотной области и лучше подходит для больших grid, но требует
+  problem-specific export.
+\end{description}
+
+\chapter{Численная основа}
+
+\section{DDA и матричный оператор}
+
+В DDA частица заменяется набором диполей. Для каждого диполя есть три
+компоненты поляризации, поэтому размер системы равен:
+
+\begin{equation}
+  n = 3N,
+\end{equation}
+
+где $N$ --- число диполей. Оператор обычно можно представить как:
+
+\begin{equation}
+  A = I - \alpha G,
+\end{equation}
+
+где $\alpha$ --- поляризуемость, а $G$ --- оператор взаимодействия диполей.
+В коде Python эта операция реализована в \file{core/fft_matvec.py}. В ADDA
+она реализована в нативном C-коде.
+
+\section{Почему FFT важен}
+
+Наивное применение плотной матрицы $A$ стоило бы $O(N^2)$. За счёт
+свёрточной структуры взаимодействия применение $A v$ можно делать через FFT:
+
+\begin{equation}
+  A v = v - \alpha \mathcal{F}^{-1}\!\left(\widehat{G}\,\mathcal{F}(v)\right).
+\end{equation}
+
+Это делает один matvec намного дешевле, но всё равно при сотнях итераций он
+остаётся главным временем расчёта.
+
+\section{Параметры grid, dpl, kd и m}
+
+\begin{longtable}{p{0.22\textwidth}p{0.68\textwidth}}
+\toprule
+Параметр & Значение в проекте \\
+\midrule
+\code{grid} & Размер дискретизации формы. Например \code{grid=80}. \\
+\code{dpl} & Dipoles per wavelength в ADDA. Часто используется \code{-dpl 15}. \\
+\code{kd} & Параметр обучения Python. В этом проекте \code{kd = 2*pi/dpl}. \\
+\code{m} & Комплексный показатель преломления: $m=m_{\mathrm{re}}+i m_{\mathrm{im}}$. \\
+\code{eps} & Точность ADDA. \code{-eps 3} соответствует порядку $10^{-3}$. \\
+\bottomrule
+\end{longtable}
+
+Для \code{dpl=15}:
+
+\begin{equation}
+  kd = \frac{2\pi}{15} = 0.41887902047863906.
+\end{equation}
+
+Экспорт нейросетевого предобуславливателя и запуск ADDA должны использовать
+одинаковые \code{grid}, \code{shape}, \code{m} и \code{dpl/kd}. Если экспорт
+сделан под одну задачу, а ADDA запущена на другой, результат нельзя считать
+валидным.
+
+\chapter{Предобуславливание в ADDA}
+
+\section{Левое предобуславливание}
+
+В патче ADDA для \code{BiCGStab} реализовано левое предобуславливание:
+
+\begin{equation}
+  M A x = M b.
+\end{equation}
+
+Это значит, что в итерационном методе многие векторы живут в
+предобусловленном пространстве. В \file{adda_src_modified/iterative.c} есть
+отдельная логика для сохранения фактической невязки исходной системы, потому
+что внутренняя невязка $M r$ не равна физической невязке $r=b-Ax$.
+
+\section{Почему предобуславливатель может замедлять}
+
+Пусть baseline требует $k_0$ итераций, а run с предобуславливателем требует
+$k_M$. Пусть стоимость одной baseline-итерации равна $C_A$, а стоимость
+итерации с предобуславливателем равна $C_A+C_M$. Тогда грубая модель:
+
+\begin{equation}
+  T_0 \approx k_0 C_A,
+\end{equation}
+
+\begin{equation}
+  T_M \approx T_{\mathrm{import}} + k_M(C_A+C_M).
+\end{equation}
+
+Ускорение есть только если:
+
+\begin{equation}
+  k_M(C_A+C_M) + T_{\mathrm{import}} < k_0 C_A.
+\end{equation}
+
+Поэтому недостаточно уменьшить число итераций на 20\%, если каждая итерация
+стала в 2 раза дороже.
+
+\section{Wall time, iterations и residual}
+
+Нужно различать три метрики:
+
+\begin{description}[leftmargin=3.5cm,style=nextline]
+  \item[Iterations]
+  Сколько итераций сделал решатель. Полезно, но не равно времени.
+
+  \item[Final residual]
+  К какой невязке пришёл решатель. Если оба run упёрлись в \code{maxiter},
+  final residual может быть важнее формального speedup.
+
+  \item[Wall time]
+  Реальное время по часам. Главная метрика для пользователя.
+\end{description}
+
+Если видим:
+
+\begin{lstlisting}
+hex_DL1_g48: 300->300 (1.0x)
+\end{lstlisting}
+
+это означает, что baseline и preconditioned run оба упёрлись в лимит 300
+итераций. Такой чекпоинт не должен становиться \code{best_model.pt}.
+
+\chapter{Архитектура ConvSAI/K2}
+
+\section{Назначение}
+
+ConvSAI/K2 --- универсальная пространственная модель. Она по форме частицы и
+физическим параметрам предсказывает локальное свёрточное ядро
+предобуславливателя. Главный класс:
+
+\begin{lstlisting}
+neural_precond.model.ConvSAI_Universal
+\end{lstlisting}
+
+Основной checkpoint:
+
+\begin{lstlisting}
+models/k2v3/checkpoints/best_model.pt
+\end{lstlisting}
+
+\section{Входы модели}
+
+Модель получает:
+
+\begin{itemize}[leftmargin=2em]
+  \item occupancy grid формы: бинарный тензор $0/1$;
+  \item $m_{\mathrm{re}}$;
+  \item $m_{\mathrm{im}}$;
+  \item $kd$;
+  \item $\log(\mathrm{grid})$.
+\end{itemize}
+
+Функция \code{positions_to_occupancy} переводит позиции диполей в 3D occupancy:
+
+\begin{equation}
+  \mathrm{positions} \rightarrow X \in \{0,1\}^{1\times1\times G\times G\times G}.
+\end{equation}
+
+\section{ShapeEncoder3D}
+
+Геометрия кодируется небольшой 3D CNN:
+
+\begin{lstlisting}
+Conv3d(1 -> 16), ReLU, MaxPool3d
+Conv3d(16 -> 32), ReLU, MaxPool3d
+Conv3d(32 -> 64), ReLU, MaxPool3d
+AdaptiveAvgPool3d(1)
+Linear(64 -> shape_embed_dim)
+\end{lstlisting}
+
+Перед encoder occupancy приводится к фиксированному разрешению
+\code{encoder_resolution=32}. Это позволяет подавать разные grid, но означает,
+что очень тонкие геометрические детали могут сглаживаться.
+
+\section{MLP и stencil}
+
+После encoder модель склеивает:
+
+\begin{equation}
+  [m_{\mathrm{re}}, m_{\mathrm{im}}, kd, \log(g), s],
+\end{equation}
+
+где $s$ --- shape embedding. При \code{shape_embed_dim=16} вход MLP имеет
+20 чисел.
+
+MLP выдаёт комплексное ядро:
+
+\begin{equation}
+  K[\Delta x,\Delta y,\Delta z] \in \C^{3\times3}.
+\end{equation}
+
+При \code{r_cut=7} stencil содержит 1419 смещений. На каждом смещении хранится
+3 на 3 комплексный блок.
+
+\section{Что значит K2}
+
+K2 или K$^2$ означает, что модель предсказывает ядро $K$, но применяется:
+
+\begin{equation}
+  \widehat{M}(k) = \widehat{K}(k)\,\widehat{K}(k).
+\end{equation}
+
+В пространстве это увеличивает эффективный радиус примерно с 7 до 14 клеток.
+Параметров модели не становится больше, но экспортируемый stencil после
+возведения в квадрат становится шире.
+
+\section{Сильные и слабые стороны}
+
+\begin{longtable}{p{0.3\textwidth}p{0.6\textwidth}}
+\toprule
+Сторона & Практический смысл \\
+\midrule
+Плюс & Один checkpoint можно использовать для разных форм и параметров. \\
+Плюс & Mode 3 файл обычно компактнее spectral-export с большим radius. \\
+Плюс & Простая архитектура и быстрый forward. \\
+Минус & Effective radius около 14 может быть недостаточен для больших grid. \\
+Минус & Универсальность снижает специализацию под hard hex-prism cases. \\
+Минус & Loss может улучшаться без улучшения real ADDA wall time. \\
+\bottomrule
+\end{longtable}
+
+\chapter{Архитектура Spectral ConvSAI}
+
+\section{Главная идея}
+
+Spectral ConvSAI работает не как локальный spatial stencil predictor, а как
+частотный predictor. Для каждой точки FFT-сетки модель предсказывает:
+
+\begin{equation}
+  \widehat{M}(k) \in \C^{3\times3}.
+\end{equation}
+
+Главный класс:
+
+\begin{lstlisting}
+neural_precond.model.ConvSAI_Spectral
+\end{lstlisting}
+
+Ветка:
+
+\begin{lstlisting}
+spectral-convsai
+\end{lstlisting}
+
+\section{Вход на каждой частоте}
+
+Для каждой частоты модель получает:
+
+\begin{itemize}[leftmargin=2em]
+  \item полный комплексный $D_{\mathrm{hat}}(k)$, разложенный в 18 вещественных чисел;
+  \item координаты частоты;
+  \item глобальный conditioning-вектор от формы и физических параметров.
+\end{itemize}
+
+Глобальный conditioning строится так же концептуально: shape encoder плюс
+$m_{\mathrm{re}}, m_{\mathrm{im}}, kd, \log(g)$.
+
+\section{Почему spectral лучше масштабируется}
+
+ConvSAI/K2 ограничен spatial radius. Spectral-модель сразу работает в
+частотной области, где operator inverse естественно описывается как функция
+частоты. Поэтому на больших grid и сложных refractive indices spectral-модель
+часто сильнее.
+
+Цена:
+
+\begin{itemize}[leftmargin=2em]
+  \item экспорт зависит от конкретной задачи;
+  \item файл может быть больше;
+  \item import и apply могут стать существенной частью wall time.
+\end{itemize}
+
+\section{Transformer в spectral-модели}
+
+Transformer здесь не является моделью, которая напрямую выдаёт весь
+предобуславливатель. Он используется как coarse frequency context.
+
+Если включить:
+
+\begin{lstlisting}
+--spectral_transformer_tokens 8
+\end{lstlisting}
+
+то берётся грубая сетка частот:
+
+\begin{equation}
+  i_x,i_y,i_z = \mathrm{linspace}(0, g-1, n_{\mathrm{tokens}}).
+\end{equation}
+
+Для выбранных точек собираются признаки $D_{\mathrm{hat}}$, координаты частоты
+и квадратичные признаки. Transformer выдаёт поправку к global conditioning,
+после чего обычный per-frequency MLP предсказывает $\widehat{M}(k)$ на всех
+частотах.
+
+\section{Correction branch}
+
+В spectral-модели есть zero-initialized additive correction branch. Она нужна,
+чтобы дообучать небольшую поправку, не разрушая базовый checkpoint. Практически
+это безопаснее, чем размораживать всю модель, когда уже есть рабочая spectral
+версия.
+
+\chapter{Экспорт в ADDA}
+
+\section{Почему нужен export}
+
+ADDA не исполняет PyTorch. Она читает бинарный файл \code{.precond}. Поэтому
+любая модель проходит цепочку:
+
+\begin{equation}
+  \text{checkpoint} \rightarrow \text{export script} \rightarrow \text{.precond} \rightarrow \text{ADDA}.
+\end{equation}
+
+Если export script не соответствует архитектуре checkpoint, результат либо не
+загрузится, либо будет математически неправильным.
+
+\section{ConvSAI/K2 export}
+
+\begin{lstlisting}
+python3 apps/export_universal_precond.py \
+  --checkpoint models/k2v3/checkpoints/best_model.pt \
+  --squared_kernel \
+  --shape prism \
+  --ay 6.0 \
+  --az 1.0 \
+  --grid 80 \
+  --m_re 2.5 \
+  --m_im 0.0 \
+  --kd 0.41887902047863906 \
+  --output exports/prism_g80_m25_k2v3.precond
+\end{lstlisting}
+
+Здесь \code{--squared_kernel} обязателен для K2 checkpoint, иначе экспорт будет
+соответствовать другой математике.
+
+\section{Spectral export}
+
+\begin{lstlisting}
+python3 apps/export_spectral_precond.py \
+  --checkpoint models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.pt \
+  --shape prism \
+  --ay 6.0 \
+  --az 1.0 \
+  --grid 80 \
+  --m_re 2.5 \
+  --m_im 0.0 \
+  --kd 0.41887902047863906 \
+  --threshold-rel 1e-6 \
+  --max-radius 40 \
+  --blend-identity 1.0 \
+  --symmetry z180_zflip \
+  --output exports/prism_g80_m25_spectral.precond
+\end{lstlisting}
+
+Параметры \code{--threshold-rel}, \code{--max-radius} и \code{--symmetry}
+контролируют, сколько spatial-компонент будет сохранено после преобразования
+из частотного представления.
+
+\section{Правило совпадения параметров}
+
+\begin{longtable}{p{0.35\textwidth}p{0.45\textwidth}}
+\toprule
+Export & ADDA \\
+\midrule
+\code{--grid 80} & \code{-grid 80} \\
+\code{--shape prism --ay 6 --az 1} & \code{-shape prism 6.0 1.0} \\
+\code{--m_re 2.5 --m_im 0.0} & \code{-m 2.5 0.0} \\
+\code{--kd 0.41887902047863906} & \code{-dpl 15} \\
+\bottomrule
+\end{longtable}
+
+Несовпадение этих параметров является одной из самых частых причин
+``ускорения без ускорения''.
+
+\chapter{Форматы precond-файлов}
+
+\section{Поддерживаемые modes}
+
+В \file{adda_src_modified/precond.h} определены основные modes:
+
+\begin{longtable}{p{0.15\textwidth}p{0.7\textwidth}}
+\toprule
+Mode & Что хранит \\
+\midrule
+0 & ILU factors. \\
+1 & Sparse approximate inverse matrix. \\
+2 & Polynomial preconditioner. \\
+3 & ConvSAI spatial stencil. \\
+4 & FFTDIRECT: готовый frequency-domain kernel. \\
+5 & FFTDIRECT\_XSLAB\_F32: x-slab float32 layout для MPI. \\
+\bottomrule
+\end{longtable}
+
+\section{Mode 3}
+
+Mode 3 хранит spatial stencil:
+
+\begin{equation}
+  \{(\Delta x_s,\Delta y_s,\Delta z_s), K_s\}_{s=1}^{S}.
+\end{equation}
+
+При импорте ADDA строит frequency-domain kernel через FFT. Это компактно, но
+на больших stencil и MPI import может быть заметным.
+
+\section{Mode 4}
+
+Mode 4 хранит уже готовый $\widehat{M}$ на FFT-сетке. Import быстрее, потому
+что ADDA не надо пересобирать $\widehat{M}$ из spatial stencil.
+
+\begin{lstlisting}
+python3 apps/convert_convsai_to_fftdirect.py \
+  --input exports/prism_g80_m25_spectral.precond \
+  --output exports/prism_g80_m25_spectral.fftdirect.precond \
+  --grid-x 160 \
+  --grid-y 192 \
+  --grid-z 160
+\end{lstlisting}
+
+Важно: \code{grid-x/y/z} --- это FFT grid из ADDA log, а не просто particle
+\code{-grid}.
+
+\section{Mode 5}
+
+Mode 5 хранит frequency kernel в float32 по x-slab. Это полезно для MPI, потому
+что каждый процесс может читать свою часть, а не весь dense kernel.
+
+\begin{lstlisting}
+python3 apps/convert_fftdirect_to_xslab_f32.py \
+  --input exports/prism_g80_m25_spectral.fftdirect.precond \
+  --output exports/prism_g80_m25_spectral.xslab_f32.precond
+\end{lstlisting}
+
+Mode 4/5 ускоряют import и уменьшают overhead. Они не исправляют плохой
+математический предобуславливатель.
+
+\chapter{Сборка и запуск ADDA}
+
+\section{Сборка patched ADDA}
+
+Репозиторий не хранит весь upstream ADDA. Нужно взять чистую ADDA и наложить
+патч:
+
+\begin{lstlisting}
+git clone https://github.com/adda-team/adda adda
+cp adda_src_modified/* adda/src/
+
+make -C adda/src seq mpi \
+  FFTW3_INC_PATH="$HOME/.local/include" \
+  FFTW3_LIB_PATH="$HOME/.local/lib"
+\end{lstlisting}
+
+\section{Sequential run}
+
+\begin{lstlisting}
+export LD_LIBRARY_PATH="$HOME/.local/lib:${LD_LIBRARY_PATH:-}"
+
+adda/src/seq/adda \
+  -dir runs/prism_g80_m25_seq \
+  -grid 80 \
+  -m 2.5 0.0 \
+  -shape prism 6.0 1.0 \
+  -dpl 15 \
+  -eps 3 \
+  -iter bicgstab \
+  -precond exports/prism_g80_m25_spectral.precond
+\end{lstlisting}
+
+\section{MPI run}
+
+\begin{lstlisting}
+export LD_LIBRARY_PATH="$HOME/.local/lib:${LD_LIBRARY_PATH:-}"
+
+mpirun -np 16 adda/src/mpi/adda_mpi \
+  -dir runs/prism_g80_m25_mpi \
+  -grid 80 \
+  -m 2.5 0.0 \
+  -shape prism 6.0 1.0 \
+  -dpl 15 \
+  -eps 3 \
+  -iter bicgstab \
+  -precond exports/prism_g80_m25_spectral.precond
+\end{lstlisting}
+
+\section{FGMRES}
+
+Для больших FFTDIRECT cases иногда полезен FGMRES:
+
+\begin{lstlisting}
+ADDA_FGMRES_RESTART=100 \
+mpirun -np 16 adda/src/mpi/adda_mpi \
+  -dir runs/prism_g80_m25_mpi_fgmres \
+  -grid 80 \
+  -m 2.5 0.0 \
+  -shape prism 6.0 1.0 \
+  -dpl 15 \
+  -eps 3 \
+  -iter fgmres \
+  -precond exports/prism_g80_m25_spectral.precond
+\end{lstlisting}
+
+FGMRES использует правое предобуславливание и может требовать меньше
+preconditioner applications на эффективный шаг, но его надо сравнивать
+эмпирически на целевых cases.
+
+\chapter{Обучение}
+
+\section{Файл trainer}
+
+Главный trainer:
+
+\begin{lstlisting}
+train_v7/train.py
+\end{lstlisting}
+
+Он делает цикл:
+
+\begin{enumerate}[leftmargin=2em]
+  \item сэмплирует форму, grid, $m$, $kd$;
+  \item строит позиции диполей;
+  \item строит \code{FFTMatVec};
+  \item строит occupancy grid;
+  \item получает kernel или spectral conditioning от модели;
+  \item считает loss;
+  \item делает backward и AdamW step;
+  \item периодически запускает validation.
+\end{enumerate}
+
+Базовый seed в trainer:
+
+\begin{lstlisting}
+seed = 42
+\end{lstlisting}
+
+\section{Точность вычислений}
+
+По умолчанию веса модели обучаются в fp32. Однако многие операции с системой,
+FFTMatVec и комплексными векторами выполняются в \code{complex128}. Export
+пишет комплексные double значения в \code{.precond}. AMP/fp16 в стандартной
+команде обучения не включены.
+
+\section{Loss-функции}
+
+\subsection{Probe loss}
+
+Идея:
+
+\begin{equation}
+  \mathcal{L}_{\mathrm{probe}} =
+  \mathbb{E}_z
+  \frac{\|M A z - z\|^2}{\|z\|^2}.
+\end{equation}
+
+Это проверяет, похож ли $M$ на левый inverse. Минус: случайные векторы могут
+плохо коррелировать с реальными plane-wave RHS в ADDA.
+
+\subsection{Adversarial probe loss}
+
+Ищет плохие направления для $I-MA$ через power iteration, затем учит модель на
+них. Это сильнее обычного probe loss, но всё равно не гарантирует real ADDA
+speedup.
+
+\subsection{Planewave Krylov loss}
+
+Использует RHS, похожие на ADDA plane wave. Вместо случайной правой части
+строятся две поляризации падающей волны. Это ближе к реальной задаче.
+
+\subsection{Planewave BiCGStab loss}
+
+Unrolled left-preconditioned BiCGStab loss. Он пытается оптимизировать именно
+то, что делает ADDA solver. Но у него есть опасность: если loss слишком
+свободный, модель может улучшать краткий unroll, не оставаясь хорошим
+приближением $A^{-1}$.
+
+\subsection{Зачем anchor-термы}
+
+Anchor-термы возвращают модель к смыслу inverse:
+
+\begin{equation}
+  M A z \approx z,
+\end{equation}
+
+\begin{equation}
+  A M z \approx z.
+\end{equation}
+
+Практический вывод: для ConvSAI/K2 fine-tune на \code{planewave_bicgstab}
+опасно ставить:
+
+\begin{lstlisting}
+--anchor_probe_weight 0.0
+--anchor_right_probe_weight 0.0
+\end{lstlisting}
+
+Такой запуск может показывать улучшающийся loss, но не давать ускорения в
+ADDA. Более разумный старт:
+
+\begin{lstlisting}
+--anchor_probe_weight 0.1
+--anchor_right_probe_weight 0.1
+--anchor_num_probes 1
+--anchor_probe_chunk 1
+\end{lstlisting}
+
+\chapter{Guarded validation}
+
+\section{Зачем gate}
+
+Нельзя сохранять \code{best_model.pt} только потому, что training loss стал
+лучше. Нужна схема:
+
+\begin{equation}
+  \text{train chunk}
+  \rightarrow
+  \text{export candidate}
+  \rightarrow
+  \text{ADDA MPI validation}
+  \rightarrow
+  \text{promote only if better}.
+\end{equation}
+
+Именно для этого используется:
+
+\begin{lstlisting}
+--guarded_val
+--solve_val_interval 250
+--guarded_min_large_speedup 1.01
+\end{lstlisting}
+
+\section{Исправленная проблема ConvSAI/K2 validation}
+
+В текущей рабочей копии исправлена важная ошибка: large-grid ADDA validation
+раньше был жёстко завязан на spectral exporter. Для ConvSAI/K2 это неправильно.
+
+Правильная логика:
+
+\begin{lstlisting}
+if spectral:
+    apps/export_spectral_precond.py
+else:
+    apps/export_universal_precond.py
+\end{lstlisting}
+
+Также для \code{SquaredConvSAI} validation checkpoint сохраняется без префикса
+\code{base.}, чтобы \code{export_universal_precond.py} мог его загрузить.
+
+\section{Фильтрация validation по форме}
+
+Если обучение запущено так:
+
+\begin{lstlisting}
+--only_shape hex_prism
+--hex_dl_min 1.0
+--hex_dl_max 1.0
+\end{lstlisting}
+
+то validation должен проверять hex-prism DL=1, а не sphere. Поэтому добавлена
+фильтрация fixed validation configs по \code{only_shape} и диапазону DL.
+
+\section{Как читать gate}
+
+Пример плохого, но корректно обработанного результата:
+
+\begin{lstlisting}
+Validation (3 configs) speedup: 1.12x
+hex_DL1_g32: 1000->751 (1.3x) | hex_DL1_g40: 1000->1000 (1.0x) | hex_DL1_g48: 300->300 (1.0x)
+Guarded best gate: FAIL; required large-grid ADDA cases did not pass: hex_DL1_g48
+>>> Best update skipped: guarded large-grid gate failed
+\end{lstlisting}
+
+Это значит, что trainer не испортил \code{best_model.pt}. Periodic
+\code{model_step500.pt} может существовать, но он не является хорошей моделью.
+
+\chapter{Практические команды обучения}
+
+\section{ConvSAI/K2 baseline training}
+
+\begin{lstlisting}
+python3 train_v7/train.py \
+  --name convsai_universal_k2_v3 \
+  --device 0 \
+  --save \
+  --loss adversarial \
+  --squared_kernel \
+  --r_cut 7 \
+  --hidden_size 512 \
+  --num_layers 4 \
+  --grid_min 8 \
+  --grid_max 64 \
+  --m_re_min 1.5 \
+  --m_re_max 4.0 \
+  --kd_min 0.2 \
+  --kd_max 0.8 \
+  --ema_decay 0.999 \
+  --warmup_steps 500 \
+  --num_steps 60000 \
+  --lr 5e-4
+\end{lstlisting}
+
+\section{ConvSAI/K2 large-grid gated fine-tune with anchors}
+
+\begin{lstlisting}
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python3 -u train_v7/train.py \
+  --resume models/k2v3/checkpoints/best_model.pt \
+  --name convsai_k2_hex_g32to96_adda_gated_anchor \
+  --device 0 \
+  --save \
+  --loss planewave_bicgstab \
+  --squared_kernel \
+  --r_cut 7 \
+  --hidden_size 512 \
+  --num_layers 4 \
+  --only_shape hex_prism \
+  --hex_dl_min 1.0 \
+  --hex_dl_max 1.0 \
+  --grid_min 32 \
+  --grid_max 96 \
+  --m_re_min 2.0 \
+  --m_re_max 3.2 \
+  --m_im_min 0.0 \
+  --m_im_max 0.0 \
+  --kd_min 0.41887902047863906 \
+  --kd_max 0.41887902047863906 \
+  --krylov_iters 1 \
+  --anchor_probe_weight 0.1 \
+  --anchor_right_probe_weight 0.1 \
+  --anchor_num_probes 1 \
+  --anchor_probe_chunk 1 \
+  --lr 2e-6 \
+  --warmup_steps 100 \
+  --ema_decay 0.0 \
+  --curriculum_frac 0.0 \
+  --guarded_val \
+  --guarded_min_large_speedup 1.01 \
+  --solve_val_interval 250 \
+  --val_interval 0 \
+  --adda_val_np 16 \
+  --adda_val_eps 3 \
+  --adda_val_maxiter_base 300 \
+  --adda_val_maxiter_precond 300 \
+  --adda_val_timeout 600 \
+  --adda_mpi_bin adda/src/mpi/adda_mpi \
+  --fftw_lib_path "$HOME/.local/lib" \
+  --skip_final_eval \
+  --log_interval 10 \
+  --save_interval 250 \
+  --num_steps 5000
+\end{lstlisting}
+
+\section{Spectral continuation loop}
+
+В ветке \code{spectral-convsai} используется promotion loop:
+
+\begin{lstlisting}
+DEVICE=0 \
+SEED_BASE=6200 \
+CYCLES=200 \
+STEPS_PER_CYCLE=25 \
+LR=2e-6 \
+TRAIN_GRID_MIN=32 \
+TRAIN_GRID_MAX=96 \
+VAL_GRIDS=80,96 \
+SCORE_MODE=max \
+M_RE=3.0 \
+M_IM=0.0 \
+DPL=15 \
+KD=0.41887902047863906 \
+RADIUS=40 \
+LOSS=planewave_bicgstab \
+KRYLOV_ITERS=1 \
+ANCHOR_PROBE_WEIGHT=0.0 \
+ANCHOR_RIGHT_PROBE_WEIGHT=0.0 \
+SPECTRAL_FREQ_CHUNK_SIZE=65536 \
+SPECTRAL_FREQ_CHECKPOINT_CHUNKS=1 \
+CURRICULUM_FRAC=0.0 \
+NP=16 \
+VAL_MAXITER=120 \
+VAL_TIMEOUT=600 \
+EXPORT_SYMMETRY=z180_zflip \
+START_CHECKPOINT=models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.pt \
+BEST_CHECKPOINT=models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym_resume.pt \
+BEST_SCORE_FILE=models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym_resume.score \
+NAME_PREFIX=SPECTRAL_RESUME_G32TO96_SYM_R40 \
+RUN_ROOT=runs/SPECTRAL_RESUME_G32TO96_SYM_R40 \
+./train_spectral_hex_real_loop.sh
+\end{lstlisting}
+
+\chapter{Как смотреть логи}
+
+\section{Процессы}
+
+\begin{lstlisting}
+ps -eo pid,ppid,stat,etime,cmd | rg 'train_v7|adda_mpi|mpirun'
+\end{lstlisting}
+
+\section{GPU}
+
+\begin{lstlisting}
+nvidia-smi
+\end{lstlisting}
+
+\section{Лог обучения}
+
+\begin{lstlisting}
+tail -f logs/<RUN_NAME>/train.log
+\end{lstlisting}
+
+\section{Файлы результата}
+
+\begin{lstlisting}
+find results/<RUN_NAME> -maxdepth 1 -type f -printf '%f %s\n' | sort
+\end{lstlisting}
+
+\section{Типичная строка training log}
+
+\begin{lstlisting}
+[500/5000] loss=-1.205630 gnorm=10.9315 lr=2.0e-06 1.4 steps/s (hex_DL1.00 g48 m=2.70+0.00i kd=0.42)
+\end{lstlisting}
+
+\begin{description}[leftmargin=3.2cm,style=nextline]
+  \item[\code{loss}]
+  Внутренний training loss. Не равен speedup.
+
+  \item[\code{gnorm}]
+  Норма градиента после clipping.
+
+  \item[\code{steps/s}]
+  Скорость обучения. На больших grid она резко ниже.
+
+  \item[\code{hex_DL1.00 g48}]
+  Текущая сэмплированная задача.
+\end{description}
+
+\chapter{Heatmap и benchmark}
+
+\section{Что должна показывать heatmap}
+
+Хорошая heatmap должна измерять не только факт запуска, а минимум:
+
+\begin{itemize}[leftmargin=2em]
+  \item baseline wall time;
+  \item preconditioned wall time;
+  \item speedup;
+  \item iterations;
+  \item final residual;
+  \item converged/capped status;
+  \item export/import overhead, если это часть workflow.
+\end{itemize}
+
+\section{Три разных speedup}
+
+\begin{description}[leftmargin=4.2cm,style=nextline]
+  \item[\code{heatmap_adda_wall_speedup}]
+  Ускорение самого ADDA solve.
+
+  \item[\code{heatmap_precond_wall_s}]
+  Абсолютное время preconditioned run.
+
+  \item[\code{heatmap_total_elapsed_speedup}]
+  Ускорение полного pipeline, если туда входят export/import.
+\end{description}
+
+Для одного запуска total elapsed speedup может быть плохим, потому что export
+и import не успевают окупиться. Для \code{-orient avg} на сотни ориентаций
+import/export amortized, и картина может быть лучше.
+
+\section{Ориентации}
+
+Ускорение может зависеть от orientation, потому что меняется правая часть,
+путь сходимости и взаимодействие с симметрией частицы. Для честной оценки
+\code{-orient avg} нужно тестировать не один угол, а набор ориентаций:
+
+\begin{equation}
+  S = \frac{1}{N}\sum_{i=1}^{N}
+  \frac{T_{0,i}}{T_{M,i}}.
+\end{equation}
+
+Также стоит смотреть worst case:
+
+\begin{equation}
+  S_{\min} = \min_i \frac{T_{0,i}}{T_{M,i}}.
+\end{equation}
+
+\chapter{Текущие результаты и ограничения}
+
+\section{Spectral}
+
+По актуальным заметкам ветки \code{spectral-convsai}:
+
+\begin{lstlisting}
+mean ADDA wall-time speedup: 9.93x
+max ADDA wall-time speedup: 23.33x
+mean total elapsed speedup including export: 4.43x
+max total elapsed speedup including export: 15.87x
+\end{lstlisting}
+
+После MPI distributed fix были локальные проверки:
+
+\begin{longtable}{p{0.3\textwidth}p{0.18\textwidth}p{0.18\textwidth}p{0.18\textwidth}}
+\toprule
+Case & Baseline & New precond & Speedup \\
+\midrule
+sphere g32, m=3 & 15.31 s & 2.13 s & 7.19x \\
+sphere g48, m=3 & 108.26 s & 8.09 s & 13.38x \\
+sphere g64, m=2 & 141.24 s & 53.69 s & 2.63x \\
+\bottomrule
+\end{longtable}
+
+Вывод: 20x возможно в отдельных областях heatmap, но не является постоянной
+гарантией по всем grid, m, shape и orientation.
+
+\section{ConvSAI/K2}
+
+Исторически K2 v3 давал большие итерационные ускорения на умеренных задачах,
+например около 30x по итерациям на некоторых g33 cases. Но свежий hard
+hex-prism test показал плохую картину:
+
+\begin{longtable}{p{0.22\textwidth}p{0.16\textwidth}p{0.18\textwidth}p{0.22\textwidth}}
+\toprule
+Run & Wall time & Iters & Status \\
+\midrule
+baseline & 21.291 s & 600 & cap \\
+k2 original & 43.588 s & 600 & cap, worse residual \\
+k2 step1500 & 42.843 s & 600 & cap, worse residual \\
+k2 step2000 & 43.496 s & 600 & cap, worse residual \\
+spectral & 38.101 s & 542 & partial convergence \\
+\bottomrule
+\end{longtable}
+
+Это не значит, что ConvSAI/K2 бесполезен вообще. Это значит, что на hard
+large-grid prism case текущая K2 модель не даёт нужного ускорения и не должна
+дообучаться вслепую.
+
+\chapter{Почему последние попытки были подозрительными}
+
+\section{Проблема exporter в validation}
+
+Если ConvSAI/K2 validation использует spectral exporter, то real ADDA gate не
+проверяет настоящую ConvSAI/K2 модель. Это исправлено в \file{train_v7/train.py}.
+
+\section{Проблема нулевых anchors}
+
+Запуск с:
+
+\begin{lstlisting}
+--anchor_probe_weight 0.0
+--anchor_right_probe_weight 0.0
+\end{lstlisting}
+
+слишком свободен. Он может оптимизировать короткий unrolled BiCGStab path, но
+не удерживать $M$ как приблизительный inverse. Симптом совпал с наблюдением:
+loss улучшается, а large-grid ADDA gate остаётся \code{300->300}.
+
+\section{Что значит ``чинить'' в этом месте}
+
+Практически правильный фикс:
+
+\begin{enumerate}[leftmargin=2em]
+  \item не продолжать blind run;
+  \item запускать с anchor weights;
+  \item оставить \code{guarded_val};
+  \item сохранять \code{best_model.pt} только после ADDA PASS;
+  \item если на 750--1000 шагах gate стабильно \code{300->300}, менять подход,
+  а не просто ждать 10 часов.
+\end{enumerate}
+
+\chapter{Ограничения и направления развития}
+
+\section{Low-rank}
+
+Low-rank блок добавляет несколько глобальных мод:
+
+\begin{equation}
+  M \approx M_{\mathrm{local}} + U C V^*,
+\end{equation}
+
+где локальная часть ловит ближнюю физику, а low-rank часть ловит дальние
+медленные modes. Это естественное развитие для ConvSAI/K2, потому что его
+главная слабость --- ограниченный radius.
+
+\section{Deflation}
+
+Deflation явно убирает из Krylov-решателя плохие медленно сходящиеся
+направления. Идея:
+
+\begin{equation}
+  \mathcal{K} \rightarrow \mathcal{K} \oplus \mathrm{span}(u_1,\dots,u_r).
+\end{equation}
+
+Это может быть полезно, если heatmap показывает повторяющиеся bad modes.
+
+\section{SO(3) equivariance}
+
+Обычный 3D CNN не гарантирует корректного поведения при произвольных
+поворотах. Для \code{-orient avg} полезна архитектура или аугментация, которая
+учитывает вращения:
+
+\begin{equation}
+  f(Rx) = R f(x) R^{-1}.
+\end{equation}
+
+Для призм также важны дискретные симметрии, например \code{z180} и
+\code{zflip}.
+
+\section{Analytic circulant inverse}
+
+Так как FFT-оператор уже имеет block-circulant структуру, можно строить часть
+предобуславливателя аналитически в частотной области, а нейросетью учить
+только поправку. Spectral branch ближе всего к этой идее.
+
+\section{Аугментации}
+
+Нужные аугментации для ориентаций:
+
+\begin{itemize}[leftmargin=2em]
+  \item случайные \code{alpha beta gamma};
+  \item повороты occupancy grid;
+  \item symmetry-aware export для призмы;
+  \item validation на нескольких orientation seeds;
+  \item отдельный average и worst-case speedup.
+\end{itemize}
+
+\chapter{Практический чеклист}
+
+\section{Перед запуском}
+
+\begin{enumerate}[leftmargin=2em]
+  \item Убедиться, что ветка правильная: \code{convsai-universal} или
+  \code{spectral-convsai}.
+  \item Собрать patched ADDA.
+  \item Проверить \code{LD_LIBRARY_PATH}.
+  \item Проверить, что export параметры совпадают с ADDA параметрами.
+  \item Проверить, что используется правильный exporter.
+\end{enumerate}
+
+\section{Перед доверием к checkpoint}
+
+\begin{enumerate}[leftmargin=2em]
+  \item Это \code{best_model.pt}, а не случайный \code{model_step*.pt}.
+  \item В логе есть \code{Guarded best gate: PASS}.
+  \item Есть сравнение с baseline на той же задаче.
+  \item Проверены wall time, iterations и final residual.
+  \item Проверено несколько grid/m/orientation.
+\end{enumerate}
+
+\section{Если нет ускорения}
+
+\begin{enumerate}[leftmargin=2em]
+  \item Проверить совпадение export/run параметров.
+  \item Проверить, не упёрлись ли оба run в \code{maxiter}.
+  \item Проверить final residual.
+  \item Проверить preconditioner apply time.
+  \item Проверить import overhead.
+  \item Для ConvSAI/K2 проверить anchors и guarded validation.
+  \item Для Spectral проверить radius, threshold и symmetry.
+\end{enumerate}
+
+\chapter{Карта файлов}
+
+\begin{longtable}{p{0.38\textwidth}p{0.52\textwidth}}
+\toprule
+Файл или папка & Назначение \\
+\midrule
+\file{README.md} & Краткая инструкция текущей ветки. \\
+\file{docs/PROJECT_BOOK_RU.tex} & Этот LaTeX-документ. \\
+\file{docs/PROJECT_BOOK_RU.md} & Старый Markdown-конспект, оставлен как черновик. \\
+\file{train_v7/train.py} & Trainer, validation, checkpoint logic. \\
+\file{neural_precond/model.py} & ConvSAI, Spectral, ShapeEncoder, transformer. \\
+\file{neural_precond/loss.py} & Loss-функции. \\
+\file{apps/export_universal_precond.py} & ConvSAI/K2 export. \\
+\file{apps/export_spectral_precond.py} & Spectral export в ветке \code{spectral-convsai}. \\
+\file{apps/convert_convsai_to_fftdirect.py} & Mode 3 -> mode 4. \\
+\file{apps/convert_fftdirect_to_xslab_f32.py} & Mode 4 -> mode 5. \\
+\file{adda_src_modified/precond.c} & Загрузка и применение preconditioner в ADDA. \\
+\file{adda_src_modified/iterative.c} & Изменения solver для preconditioning. \\
+\file{models/k2v3/checkpoints/best_model.pt} & ConvSAI/K2 checkpoint. \\
+\bottomrule
+\end{longtable}
+
+\backmatter
+
+\chapter{Итоговая модель понимания}
+
+Если сжать весь проект до десяти пунктов:
+
+\begin{enumerate}[leftmargin=2em]
+  \item ADDA решает $Ax=b$ итерационным методом.
+  \item Предобуславливатель $M$ должен делать $MA$ ближе к identity.
+  \item Реальная метрика --- wall time, а не training loss.
+  \item ConvSAI/K2 --- универсальный local spatial stencil predictor.
+  \item Spectral --- frequency-domain predictor, лучше подходящий для больших grid.
+  \item Export должен точно соответствовать shape/grid/m/kd.
+  \item Mode 4/5 ускоряют import, но не чинят плохой $M$.
+  \item Checkpoint должен проходить real ADDA gate.
+  \item Для \code{-orient avg} нужно тестировать много ориентаций.
+  \item Для цели 20x основной кандидат сейчас --- Spectral branch; ConvSAI/K2
+  требует осторожного gated fine-tune или архитектурного усиления.
+\end{enumerate}
+
+\end{document}

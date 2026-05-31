@@ -7,6 +7,9 @@ ADDA integration patches, and the scripts needed to train, export, and run it.
 For the frequency-domain Spectral ConvSAI model, use the `spectral-convsai`
 branch.
 
+For a full Russian project walkthrough, see `docs/PROJECT_BOOK_RU.tex`
+or the built PDF `docs/PROJECT_BOOK_RU.pdf`.
+
 ## What Is Included
 
 - Model class: `neural_precond.model.ConvSAI_Universal`
@@ -214,6 +217,62 @@ python3 train_v7/train.py \
   --num_steps 60000 \
   --lr 5e-4
 ```
+
+Large-grid hex-prism fine-tuning must use real ADDA validation. The training
+loss alone is not a reliable proxy for ADDA wall time or residual reduction.
+With `--only_shape hex_prism`, guarded validation is filtered to hex-prism
+cases inside the requested `--hex_dl_min/--hex_dl_max` range, so a targeted run
+is not accepted or rejected on sphere validation:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python3 -u train_v7/train.py \
+  --resume models/k2v3/checkpoints/best_model.pt \
+  --name convsai_k2_hex_g32to96_adda_gated \
+  --device 0 \
+  --save \
+  --loss planewave_bicgstab \
+  --squared_kernel \
+  --r_cut 7 \
+  --hidden_size 512 \
+  --num_layers 4 \
+  --only_shape hex_prism \
+  --hex_dl_min 1.0 \
+  --hex_dl_max 1.0 \
+  --grid_min 32 \
+  --grid_max 96 \
+  --m_re_min 2.0 \
+  --m_re_max 3.2 \
+  --m_im_min 0.0 \
+  --m_im_max 0.0 \
+  --kd_min 0.41887902047863906 \
+  --kd_max 0.41887902047863906 \
+  --krylov_iters 1 \
+  --anchor_probe_weight 0.1 \
+  --anchor_right_probe_weight 0.1 \
+  --anchor_num_probes 1 \
+  --anchor_probe_chunk 1 \
+  --lr 2e-6 \
+  --warmup_steps 100 \
+  --ema_decay 0.0 \
+  --curriculum_frac 0.0 \
+  --guarded_val \
+  --guarded_min_large_speedup 1.01 \
+  --solve_val_interval 250 \
+  --adda_val_np 16 \
+  --adda_val_eps 3 \
+  --adda_val_maxiter_base 300 \
+  --adda_val_maxiter_precond 300 \
+  --adda_val_timeout 600 \
+  --adda_mpi_bin adda/src/mpi/adda_mpi \
+  --fftw_lib_path "$HOME/.local/lib" \
+  --log_interval 10 \
+  --save_interval 250 \
+  --num_steps 5000
+```
+
+`best_model.pt` is updated only when the guarded ADDA MPI cases pass. Periodic
+`model_step*.pt` files are still written for manual inspection.
 
 ## Expected Behavior
 

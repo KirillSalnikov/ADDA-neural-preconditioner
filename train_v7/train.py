@@ -300,6 +300,41 @@ FIXED_VAL_CONFIGS_MULTIGRID = [
 FIXED_VAL_CONFIGS = FIXED_VAL_CONFIGS_STANDARD  # overridden by --high_m or --only_shape or --multigrid
 
 
+def _hex_dl_from_val_name(name):
+    match = re.match(r"hex_DL([0-9]+(?:\.[0-9]+)?)", name)
+    return float(match.group(1)) if match else None
+
+
+def _filter_val_configs_for_only_shape(configs, only_shape,
+                                       hex_dl_min=None, hex_dl_max=None):
+    """Keep validation cases aligned with targeted --only_shape training."""
+    if only_shape is None:
+        return list(configs)
+
+    name_prefixes = {
+        'sphere': ('sphere',),
+        'cube': ('cube',),
+        'ellipsoid': ('ell_',),
+        'cylinder': ('cylinder',),
+        'capsule': ('capsule',),
+        'hex_prism': ('hex_', 'hex'),
+    }
+    prefixes = name_prefixes.get(only_shape)
+    if prefixes is None:
+        return list(configs)
+
+    filtered = [cfg for cfg in configs if cfg[-1].startswith(prefixes)]
+    if only_shape == 'hex_prism' and hex_dl_min is not None and hex_dl_max is not None:
+        eps = 1e-9
+        dl_filtered = []
+        for cfg in filtered:
+            dl_ratio = _hex_dl_from_val_name(cfg[-1])
+            if dl_ratio is None or hex_dl_min - eps <= dl_ratio <= hex_dl_max + eps:
+                dl_filtered.append(cfg)
+        filtered = dl_filtered
+    return filtered
+
+
 # ---------------------------------------------------------------------------
 # Sampling
 # ---------------------------------------------------------------------------
@@ -516,7 +551,8 @@ def _run_adda_validation(config, grid, m_re, m_im, kd, shape_args, precond, maxi
             'mpirun', '--oversubscribe', '-np', np_mpi,
             '-x', f'LD_LIBRARY_PATH={fftw_path}',
             adda_bin, '-grid', str(grid), '-m', str(m_re), str(m_im),
-            '-dpl', f'{dpl:.10g}', '-iter', 'bicgstab', '-eps', '5',
+            '-dpl', f'{dpl:.10g}', '-iter', 'bicgstab',
+            '-eps', str(config.get('adda_val_eps', 5)),
             '-maxiter', str(maxiter), '-dir', tmpdir,
         ] + shape_args
         if precond:
@@ -541,6 +577,63 @@ def _run_adda_validation(config, grid, m_re, m_im, kd, shape_args, precond, maxi
     hit_cap = iters is None or iters >= maxiter
     ok = result.returncode == 0 and not hit_cap
     return iters if ok else maxiter, ok, output[-400:]
+
+
+def _save_validation_checkpoint(model, config, save_path):
+    """Save a checkpoint in the format expected by the matching exporter."""
+    if config.get("spectral", False):
+        torch.save(model.state_dict(), save_path)
+    elif isinstance(model, SquaredConvSAI):
+        torch.save(model.base.state_dict(), save_path)
+    else:
+        torch.save(model.state_dict(), save_path)
+
+
+def _build_adda_export_cmd(config, save_path, grid, m_re, m_im, kd, shape, ay, az,
+                           output_path):
+    if config.get("spectral", False):
+        export_identity_blend = config.get('export_identity_blend')
+        if export_identity_blend is None:
+            export_identity_blend = config.get('spectral_identity_blend', 1.0)
+
+        cmd = [
+            sys.executable, "apps/export_spectral_precond.py",
+            "--checkpoint", save_path, "--grid", str(grid),
+            "--m_re", str(m_re), "--m_im", str(m_im), "--kd", f"{kd:.10g}",
+            "--shape", shape, "--ay", str(ay), "--az", str(az),
+            "--threshold-rel", str(config.get('export_threshold_rel', 1e-8)),
+            "--blend-identity", str(export_identity_blend),
+            "--output", output_path,
+        ]
+        export_max_radius = config.get(
+            'export_max_radius', config.get('spectral_truncate_radius', None))
+        if export_max_radius is not None:
+            cmd += ["--max-radius", str(export_max_radius)]
+        if config.get("spectral_normalize_inputs", False):
+            cmd.append("--normalize-inputs")
+        return cmd
+
+    if config.get("separable", False) or config.get("hybrid", False):
+        raise ValueError("ADDA validation export is implemented for ConvSAI Universal/K2, "
+                         "Multigrid, and Spectral models only")
+
+    cmd = [
+        sys.executable, "apps/export_universal_precond.py",
+        "--checkpoint", save_path, "--grid", str(grid),
+        "--m_re", str(m_re), "--m_im", str(m_im), "--kd", f"{kd:.10g}",
+        "--shape", shape, "--ay", str(ay), "--az", str(az),
+        "--r_cut", str(config.get("r_cut", 7)),
+        "--hidden_size", str(config.get("hidden_size", 512)),
+        "--num_layers", str(config.get("num_layers", 4)),
+        "--shape_embed_dim", str(config.get("shape_embed_dim", 16)),
+        "--encoder_resolution", str(config.get("encoder_resolution", 32)),
+        "--output", output_path,
+    ]
+    if config.get("multigrid_levels", 0) > 1:
+        cmd += ["--multigrid_levels", str(config.get("multigrid_levels"))]
+    elif config.get("squared_kernel", False):
+        cmd.append("--squared_kernel")
+    return cmd
 
 
 @torch.no_grad()
@@ -602,26 +695,10 @@ def validate_fixed(model, config, device, encoder_resolution, rtol=1e-5,
             shape, ay, az, shape_args = _shape_from_val_name(name)
             try:
                 save_path = os.path.join(config['folder'], "tmp_val.pt")
-                torch.save(model.state_dict(), save_path)
-                export_identity_blend = config.get('export_identity_blend')
-                if export_identity_blend is None:
-                    export_identity_blend = config.get('spectral_identity_blend', 1.0)
-
-                export_cmd = [
-                    sys.executable, "apps/export_spectral_precond.py",
-                    "--checkpoint", save_path, "--grid", str(grid),
-                    "--m_re", str(m_re), "--m_im", str(m_im), "--kd", f"{kd:.10g}",
-                    "--shape", shape, "--ay", str(ay), "--az", str(az),
-                    "--threshold-rel", str(config.get('export_threshold_rel', 1e-8)),
-                    "--blend-identity", str(export_identity_blend),
-                    "--output", tmp_precond,
-                ]
-                export_max_radius = config.get('export_max_radius',
-                                               config.get('spectral_truncate_radius', None))
-                if export_max_radius is not None:
-                    export_cmd += ["--max-radius", str(export_max_radius)]
-                if config.get("spectral_normalize_inputs", False):
-                    export_cmd.append("--normalize-inputs")
+                _save_validation_checkpoint(model, config, save_path)
+                export_cmd = _build_adda_export_cmd(
+                    config, save_path, grid, m_re, m_im, kd, shape, ay, az,
+                    tmp_precond)
 
                 res = subprocess.run(export_cmd, capture_output=True, text=True)
                 if res.returncode != 0 or not os.path.exists(tmp_precond):
@@ -1240,6 +1317,8 @@ if __name__ == "__main__":
                         help="Baseline max iterations for large-grid ADDA validation")
     parser.add_argument("--adda_val_maxiter_precond", type=int, default=2000,
                         help="Preconditioned max iterations for large-grid ADDA validation")
+    parser.add_argument("--adda_val_eps", type=int, default=5,
+                        help="ADDA -eps value for large-grid validation")
     parser.add_argument("--adda_mpi_bin", type=str, default="adda/src/mpi/adda_mpi")
     parser.add_argument("--fftw_lib_path", type=str, default="~/.local/lib")
     parser.add_argument("--separable", action='store_true',
@@ -1340,6 +1419,21 @@ if __name__ == "__main__":
         FIXED_VAL_CONFIGS.clear()
         FIXED_VAL_CONFIGS.extend(FIXED_VAL_CONFIGS_BOX)
         print("Using BOX-only validation configs")
+
+    if args.only_shape is not None:
+        filtered_configs = _filter_val_configs_for_only_shape(
+            FIXED_VAL_CONFIGS, args.only_shape,
+            hex_dl_min=args.hex_dl_min, hex_dl_max=args.hex_dl_max)
+        if filtered_configs:
+            before_count = len(FIXED_VAL_CONFIGS)
+            FIXED_VAL_CONFIGS.clear()
+            FIXED_VAL_CONFIGS.extend(filtered_configs)
+            if len(filtered_configs) != before_count:
+                print(f"Filtered validation to {args.only_shape}: "
+                      f"{len(filtered_configs)}/{before_count} configs")
+        else:
+            print(f"Warning: no fixed validation configs match --only_shape "
+                  f"{args.only_shape}; keeping the selected validation set")
 
     pprint.pprint(config)
     print()
