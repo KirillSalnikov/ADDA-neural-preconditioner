@@ -128,9 +128,9 @@ class TestResults:
         # plt.xscale("log")
         # plt.xlim(right=2)
         
-        plt.title(f"$\kappa(A)=${c.item():.2e}")
+        plt.title(fr"$\kappa(A)=${c.item():.2e}")
         plt.ylabel("Frequency")
-        plt.xlabel("$\lambda$")
+        plt.xlabel(r"$\lambda$")
         plt.savefig(f"{self.folder}/eigenvalues_{self.method}_{name}.png")
         plt.close()
     

@@ -99,6 +99,7 @@ ADDA must use the matching `-grid`, `-shape`, `-m`, and `-dpl`. For `dpl=15`,
 Sequential:
 
 ```bash
+mkdir -p runs
 export LD_LIBRARY_PATH="$HOME/.local/lib:${LD_LIBRARY_PATH:-}"
 
 adda/src/seq/adda \
@@ -115,6 +116,7 @@ adda/src/seq/adda \
 MPI:
 
 ```bash
+mkdir -p runs
 export LD_LIBRARY_PATH="$HOME/.local/lib:${LD_LIBRARY_PATH:-}"
 
 mpirun -np 16 adda/src/mpi/adda_mpi \
@@ -155,7 +157,16 @@ python3 apps/convert_fftdirect_to_xslab_f32.py \
 Then pass the converted `.precond` file to ADDA in the same way:
 
 ```bash
-mpirun -np 16 adda/src/mpi/adda_mpi ... \
+mkdir -p runs
+
+mpirun -np 16 adda/src/mpi/adda_mpi \
+  -dir runs/prism_g80_m25_mpi_k2v3_fftdirect \
+  -grid 80 \
+  -m 2.5 0.0 \
+  -shape prism 6.0 1.0 \
+  -dpl 15 \
+  -eps 3 \
+  -iter bicgstab \
   -precond exports/prism_g80_m25_k2v3.fftdirect.precond
 ```
 

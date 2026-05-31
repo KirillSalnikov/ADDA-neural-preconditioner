@@ -61,6 +61,7 @@ bool ipr_required;  /* whether inner product in MatVec will be used by iterative
                        initialization, e.g., for OpenCL) */
 double propAlongZ;  // equal 0 for general incidence, and +-1 for incidence along the z-axis (can be used as flag)
 bool rectDip;       // whether using rectangular-cuboid (non-cubical) dipoles (voxels)
+bool one_pol_y;     // fast mode: calculate only Y incident polarization
 
 // 3D vectors (in particle reference frame)
 double prop[3];               // incident direction
@@ -128,6 +129,7 @@ TIME_TYPE Timing_EField,      // time for calculating scattered fields
 
 // preconditioner
 const char *precond_filename=NULL;
+bool precond_init_only=false;
 const char *dump_dhat_filename=NULL;
 
 // related to a nearby surface
@@ -164,4 +166,3 @@ int *position; // no reason to restrict this to short in sparse mode; actually i
 int * restrict position_full;
 
 #endif // !SPARSE
-

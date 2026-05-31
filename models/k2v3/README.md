@@ -76,7 +76,7 @@ adda/src/seq/adda \
 - `../../train_v7/train.py` — скрипт обучения
 - `../../apps/export_universal_precond.py` — скрипт экспорта
 - `../../neural_precond/model.py` — класс `ConvSAI_Universal`
-- `../../adda/src/precond.c` — C код применения в ADDA
+- `../../adda_src_modified/precond.c` — C код применения в ADDA, копируется в чистый upstream ADDA
 
 ## Преимущества и ограничения
 

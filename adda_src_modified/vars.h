@@ -43,7 +43,7 @@ extern bool symX,symY,symZ,symR;
 
 // flags
 extern bool prognosis,yzplane,scat_plane,store_mueller,all_dir,scat_grid,phi_integr,sh_granul,reduced_FFT,orient_avg,
-	load_chpoint,beam_asym,anisotropy,save_memory,ipr_required,rectDip;
+	load_chpoint,beam_asym,anisotropy,save_memory,ipr_required,rectDip,one_pol_y;
 extern double propAlongZ;
 
 // 3D vectors
@@ -82,6 +82,7 @@ extern TIME_TYPE Timing_EField,Timing_FileIO,Timing_Integration,tstart_main;
 
 // preconditioner
 extern const char *precond_filename;
+extern bool precond_init_only;
 extern const char *dump_dhat_filename;
 
 // related to a nearby surface

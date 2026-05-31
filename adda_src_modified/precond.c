@@ -1251,6 +1251,7 @@ void PrecondLoad(const char *filename)
 {
 	FILE *f;
 	uint64_t header[5];
+	const size_t actual_n=3*nvoid_Ndip;
 
 	f=fopen(filename,"rb");
 	if (f==NULL) LogError(ONE_POS,"Failed to open preconditioner file '%s'",filename);
@@ -1282,6 +1283,17 @@ void PrecondLoad(const char *filename)
 		LoadFFTDirectXSlabF32(f,filename);
 	} else {
 		LogError(ONE_POS,"Unknown preconditioner mode %lu in file '%s'",(unsigned long)precond.mode,filename);
+	}
+
+	if (IsConvFFTMode()) {
+		if (precond.n!=actual_n && IFROOT)
+			printf("Conv/FFT preconditioner header n=%zu, using ADDA particle n=%zu\n",
+				precond.n,actual_n);
+		precond.n=actual_n;
+	}
+	else if (precond.n!=actual_n) {
+		LogError(ONE_POS,"Preconditioner vector length %zu != ADDA particle vector length %zu in '%s'",
+			precond.n,actual_n,filename);
 	}
 
 	// Allocate temporary buffers (needed by all modes for left preconditioning in iterative.c)
