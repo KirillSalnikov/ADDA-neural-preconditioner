@@ -67,7 +67,7 @@ models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.pt
 grid 32..96, `m=3+0i`, `kd=2*pi/15`, с радиусом экспорта 40 и симметрией
 `z180_zflip` при real-ADDA проверке.
 
-Точная команда запуска обучения:
+Команда для продолжения обучения от checkpoint, который лежит в репозитории:
 
 ```bash
 DEVICE=0 \
@@ -95,11 +95,11 @@ NP=16 \
 VAL_MAXITER=120 \
 VAL_TIMEOUT=600 \
 EXPORT_SYMMETRY=z180_zflip \
-START_CHECKPOINT=models/spectral/checkpoints/best_hex_prism_real_32to96_r40.pt \
-BEST_CHECKPOINT=models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.pt \
-BEST_SCORE_FILE=models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.score \
-NAME_PREFIX=SPECTRAL_QUALITY10H_G32TO96_SYM_R40_20260525_100039 \
-RUN_ROOT=runs/SPECTRAL_QUALITY10H_G32TO96_SYM_R40_20260525_100039 \
+START_CHECKPOINT=models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.pt \
+BEST_CHECKPOINT=models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym_resume.pt \
+BEST_SCORE_FILE=models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym_resume.score \
+NAME_PREFIX=SPECTRAL_RESUME_G32TO96_SYM_R40 \
+RUN_ROOT=runs/SPECTRAL_RESUME_G32TO96_SYM_R40 \
 ./train_spectral_hex_real_loop.sh
 ```
 
@@ -147,6 +147,8 @@ python3 apps/export_spectral_precond.py \
 ## Запуск ADDA
 
 ```bash
+mkdir -p runs
+
 LD_LIBRARY_PATH=$HOME/.local/lib \
 adda/src/seq/adda \
     -grid 33 -m 3.0 0.0 -shape sphere \
@@ -157,6 +159,7 @@ adda/src/seq/adda \
 MPI пример импорта этого `.precond` в ADDA:
 
 ```bash
+mkdir -p runs
 export LD_LIBRARY_PATH="$HOME/.local/lib:${LD_LIBRARY_PATH:-}"
 
 mpirun -np 16 adda/src/mpi/adda_mpi \
@@ -174,6 +177,8 @@ mpirun -np 16 adda/src/mpi/adda_mpi \
 прекондиционер один раз на шаг Arnoldi:
 
 ```bash
+mkdir -p runs
+
 ADDA_FGMRES_RESTART=100 \
 mpirun -np 16 adda/src/mpi/adda_mpi \
     -dir runs/prism_g80_m25_mpi_quality10h_sym_fgmres \
@@ -200,7 +205,7 @@ mpirun -np 16 adda/src/mpi/adda_mpi \
 - `../../train_v7/train.py` — скрипт обучения (с флагом `--spectral`)
 - `../../apps/export_spectral_precond.py` — скрипт экспорта
 - `../../neural_precond/model.py` — класс `ConvSAI_Spectral`
-- `../../adda/src/precond.c` — C код применения в ADDA
+- `../../adda_src_modified/precond.c` — C код применения в ADDA, копируется в чистый upstream ADDA
 
 ## Преимущества и ограничения
 

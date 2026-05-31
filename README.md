@@ -70,6 +70,7 @@ ADDA must use the matching `-grid`, `-shape`, `-m`, and `-dpl`. For `dpl=15`,
 Sequential:
 
 ```bash
+mkdir -p runs
 export LD_LIBRARY_PATH="$HOME/.local/lib:${LD_LIBRARY_PATH:-}"
 
 adda/src/seq/adda \
@@ -86,6 +87,7 @@ adda/src/seq/adda \
 MPI:
 
 ```bash
+mkdir -p runs
 export LD_LIBRARY_PATH="$HOME/.local/lib:${LD_LIBRARY_PATH:-}"
 
 mpirun -np 16 adda/src/mpi/adda_mpi \
@@ -102,6 +104,8 @@ mpirun -np 16 adda/src/mpi/adda_mpi \
 Experimental FGMRES, useful for large FFTDIRECT/preconditioner-heavy cases:
 
 ```bash
+mkdir -p runs
+
 ADDA_FGMRES_RESTART=100 \
 mpirun -np 16 adda/src/mpi/adda_mpi \
   -dir runs/prism_g80_m25_mpi_spectral_fgmres \
@@ -140,11 +144,11 @@ python3 apps/convert_fftdirect_to_xslab_f32.py \
 ## Training
 
 The large-grid checkpoint was trained with a real-ADDA promotion loop. The loop
-starts from `best_hex_prism_real_32to96_r40.pt`, trains 25-step chunks, exports
-each candidate with `--symmetry z180_zflip`, evaluates ADDA on grids 80 and 96,
-and promotes only candidates with a better worst validation residual.
+trains 25-step chunks, exports each candidate with `--symmetry z180_zflip`,
+evaluates ADDA on grids 80 and 96, and promotes only candidates with a better
+worst validation residual.
 
-Exact launch command:
+Copy-paste launch command to continue from the bundled checkpoint:
 
 ```bash
 DEVICE=0 \
@@ -172,11 +176,11 @@ NP=16 \
 VAL_MAXITER=120 \
 VAL_TIMEOUT=600 \
 EXPORT_SYMMETRY=z180_zflip \
-START_CHECKPOINT=models/spectral/checkpoints/best_hex_prism_real_32to96_r40.pt \
-BEST_CHECKPOINT=models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.pt \
-BEST_SCORE_FILE=models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.score \
-NAME_PREFIX=SPECTRAL_QUALITY10H_G32TO96_SYM_R40_20260525_100039 \
-RUN_ROOT=runs/SPECTRAL_QUALITY10H_G32TO96_SYM_R40_20260525_100039 \
+START_CHECKPOINT=models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.pt \
+BEST_CHECKPOINT=models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym_resume.pt \
+BEST_SCORE_FILE=models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym_resume.score \
+NAME_PREFIX=SPECTRAL_RESUME_G32TO96_SYM_R40 \
+RUN_ROOT=runs/SPECTRAL_RESUME_G32TO96_SYM_R40 \
 ./train_spectral_hex_real_loop.sh
 ```
 
