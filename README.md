@@ -199,13 +199,50 @@ The script writes speedup heatmaps and absolute wall-time heatmaps, including
 `heatmap_adda_wall_speedup.png`, `heatmap_precond_wall_s.png`, and
 `heatmap_total_elapsed_speedup.png`.
 
-Recent local validation after the distributed MPI fix:
+Recent local validation on the FGMRES heatmap:
 
-| Case | Baseline ADDA | Old MPI precond path | New MPI precond path |
-|---|---:|---:|---:|
-| sphere `g32`, `m=3` | 15.31 s | 20.10 s | 2.13 s |
-| sphere `g48`, `m=3` | 108.26 s | 71.49 s | 8.09 s |
-| sphere `g64`, `m=2` | 141.24 s | 476.15 s | 53.69 s |
+- run directory: `runs/HEATMAP_FGMRES_E3_20260531_115403`;
+- shape: hex prism, `ay=6`, `az=1`, `dpl=15`, `eps=1e-3`;
+- checkpoint:
+  `models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.pt`;
+- solver with preconditioner: `ADDA_FGMRES_RESTART=100 -iter fgmres`;
+- plot files:
+  `heatmap_adda_wall_speedup.png`,
+  `heatmap_precond_wall_s.png`,
+  `heatmap_total_elapsed_speedup.png`.
+
+`heatmap_adda_wall_speedup.png` is the primary acceleration plot. It excludes
+one-time export cost, which is the right metric for repeated-orientation
+workflows such as `-orient avg`. `heatmap_total_elapsed_speedup.png` includes
+export. `heatmap_precond_wall_s.png` is absolute preconditioned solve time in
+seconds, not an acceleration ratio.
+
+Converged baseline+preconditioned cases from that heatmap:
+
+| Grid | Re(m) | ADDA wall-time speedup | Total elapsed speedup incl. export |
+|---:|---:|---:|---:|
+| 32 | 1.5 | 0.78x | 0.11x |
+| 32 | 2.0 | 2.56x | 0.34x |
+| 32 | 2.5 | 6.04x | 0.89x |
+| 32 | 3.0 | 14.46x | 1.82x |
+| 32 | 3.5 | 17.80x | 2.42x |
+| 48 | 1.5 | 0.93x | 0.16x |
+| 48 | 2.0 | 5.94x | 1.51x |
+| 48 | 2.5 | 13.91x | 4.58x |
+| 48 | 3.0 | 23.33x | 10.07x |
+| 64 | 1.5 | 1.55x | 0.40x |
+| 64 | 2.0 | 10.63x | 4.84x |
+| 64 | 2.5 | 22.81x | 13.28x |
+| 80 | 1.5 | 2.74x | 1.23x |
+| 80 | 2.0 | 12.35x | 8.66x |
+| 96 | 1.5 | 4.34x | 2.52x |
+| 96 | 2.0 | 18.67x | 15.87x |
+
+Summary over the 16 converged-comparison cells: mean ADDA wall-time speedup
+`9.93x`, max `23.33x`; mean total elapsed speedup including export `4.43x`,
+max `15.87x`. Harder cells where the baseline did not converge or timed out are
+not included in the ratio table, although the preconditioned solve did converge
+in those cases.
 
 ## Requirements
 
