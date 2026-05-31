@@ -16,6 +16,55 @@ Three families of loss:
 import torch
 
 
+def _truncate_M_hat_spatial(M_hat, max_radius=None, threshold_rel=0.0):
+    """Apply differentiable spatial truncation to frequency-domain M_hat.
+
+    The mask is selected from detached magnitudes, so gradients flow through
+    kept spatial coefficients only. This matches ADDA export more closely than
+    training a dense spectral inverse and pruning it afterwards.
+    """
+    threshold_rel = 0.0 if threshold_rel is None else float(threshold_rel)
+    if max_radius is None and threshold_rel <= 0.0:
+        return M_hat
+
+    M_spatial = torch.fft.ifftn(M_hat, dim=(2, 3, 4))
+    gx, gy, gz = M_spatial.shape[2:]
+    device = M_spatial.device
+    mask = torch.ones((gx, gy, gz), dtype=torch.bool, device=device)
+
+    if max_radius is not None:
+        r = int(max_radius)
+
+        def signed_axis(size):
+            idx = torch.arange(size, device=device)
+            return torch.where(idx <= size // 2, idx, idx - size)
+
+        x = signed_axis(gx).abs() <= r
+        y = signed_axis(gy).abs() <= r
+        z = signed_axis(gz).abs() <= r
+        radius_mask = x[:, None, None] & y[None, :, None] & z[None, None, :]
+        mask = mask & radius_mask
+
+    if threshold_rel > 0.0:
+        mag = torch.amax(torch.abs(M_spatial.detach()), dim=(0, 1))
+        cutoff = threshold_rel * torch.amax(mag)
+        mask = mask & (mag > cutoff)
+
+    M_spatial = M_spatial * mask.to(M_spatial.dtype).unsqueeze(0).unsqueeze(0)
+    return torch.fft.fftn(M_spatial, dim=(2, 3, 4))
+
+
+def _blend_M_hat_identity(M_hat, identity_blend=1.0):
+    """Return (1-lambda)I + lambda*M_hat in frequency domain."""
+    identity_blend = 1.0 if identity_blend is None else float(identity_blend)
+    if identity_blend == 1.0:
+        return M_hat
+    if identity_blend < 0.0 or identity_blend > 1.0:
+        raise ValueError("identity_blend must be in [0, 1]")
+    eye = torch.eye(3, dtype=M_hat.dtype, device=M_hat.device)
+    return M_hat * identity_blend + (1.0 - identity_blend) * eye[:, :, None, None, None]
+
+
 # ---------------------------------------------------------------------------
 # Probe losses (original)
 # ---------------------------------------------------------------------------
@@ -130,7 +179,8 @@ def poly_precond_probe_loss(model, coefficients, fft_matvec, num_probes=10):
     return loss
 
 
-def conv_sai_probe_loss(model, kernel, fft_matvec, num_probes=5):
+def conv_sai_probe_loss(model, kernel, fft_matvec, num_probes=5, chunk_size=2,
+                        log_loss=False):
     """Compute probe-based SAI loss for ConvSAI_MLP.
 
     loss = E_z[ ||M·A·z - z||² / ||z||² ]
@@ -141,11 +191,14 @@ def conv_sai_probe_loss(model, kernel, fft_matvec, num_probes=5):
     A·z is computed without gradients (A is fixed physics).
     The FFT of the kernel (build_M_hat) is differentiable via out-of-place scatter.
 
+    Probes are processed in chunks to avoid OOM on large grids.
+
     Args:
         model: ConvSAI_MLP instance (for build_M_hat method)
         kernel: (n_stencil, 3, 3) complex — from model.forward(), WITH grad
         fft_matvec: FFTMatVec instance
         num_probes: number of random probe vectors
+        chunk_size: number of probes per chunk (lower = less memory)
 
     Returns:
         loss: scalar — average normalized probe loss
@@ -164,43 +217,54 @@ def conv_sai_probe_loss(model, kernel, fft_matvec, num_probes=5):
     pos = fft_matvec.pos_shifted
     pi, pj, pk = pos[:, 0], pos[:, 1], pos[:, 2]
 
-    # Random probes z: (n, P) complex128
-    z_re = torch.randn(n, num_probes, device=device, dtype=torch.float32)
-    z_im = torch.randn(n, num_probes, device=device, dtype=torch.float32)
-    z = torch.complex(z_re.double(), z_im.double()).to(torch.complex128)
-
-    # w = A·z (no grad — A is fixed)
-    with torch.no_grad():
-        w = fft_matvec(z)  # (n, P) complex128
-
-    # Scatter w to grid (no grad through w)
-    w_reshaped = w.reshape(N, 3, num_probes)  # (N, 3, P)
-    w_grid = torch.zeros(3, num_probes, gx, gy, gz,
-                         dtype=torch.complex128, device=device)
-    w_grid[:, :, pi, pj, pk] = w_reshaped.permute(1, 2, 0)  # (3, P, N)
-
-    w_hat = torch.fft.fftn(w_grid, dim=(2, 3, 4))  # (3, P, gx, gy, gz)
-
-    # M·w via FFT convolution (grad flows through M_hat → kernel)
-    # result_hat[i, p, x, y, z] = sum_j M_hat[i, j, x, y, z] * w_hat[j, p, x, y, z]
     M_hat_c128 = M_hat.to(torch.complex128)
-    result_hat = torch.einsum('ijxyz,jpxyz->ipxyz', M_hat_c128, w_hat)
 
-    result_grid = torch.fft.ifftn(result_hat, dim=(2, 3, 4))  # (3, P, gx, gy, gz)
+    loss = torch.tensor(0.0, device=device)
+    total_probes = 0
 
-    # Gather from dipole positions
-    Mw = result_grid[:, :, pi, pj, pk]  # (3, P, N)
-    Mw = Mw.permute(2, 0, 1).reshape(n, num_probes)  # (n, P)
+    for chunk_start in range(0, num_probes, chunk_size):
+        P = min(chunk_size, num_probes - chunk_start)
 
-    # Loss: ||M·A·z - z||² / ||z||²
-    z_target = z.to(Mw.dtype)
-    residual = Mw - z_target
-    res_norm_sq = (residual.real.pow(2) + residual.imag.pow(2)).sum(dim=0)  # (P,)
-    z_norm_sq = (z_target.real.pow(2) + z_target.imag.pow(2)).sum(dim=0)    # (P,)
+        # Random probes z: (n, P) complex128
+        z_re = torch.randn(n, P, device=device, dtype=torch.float32)
+        z_im = torch.randn(n, P, device=device, dtype=torch.float32)
+        z = torch.complex(z_re.double(), z_im.double()).to(torch.complex128)
 
-    loss = (res_norm_sq / (z_norm_sq + 1e-8)).mean()
+        # w = A·z (no grad — A is fixed)
+        with torch.no_grad():
+            w = fft_matvec(z)  # (n, P) complex128
 
-    return loss
+        # Scatter w to grid (no grad through w)
+        w_reshaped = w.reshape(N, 3, P)  # (N, 3, P)
+        w_grid = torch.zeros(3, P, gx, gy, gz,
+                             dtype=torch.complex128, device=device)
+        w_grid[:, :, pi, pj, pk] = w_reshaped.permute(1, 2, 0)  # (3, P, N)
+
+        w_hat = torch.fft.fftn(w_grid, dim=(2, 3, 4))  # (3, P, gx, gy, gz)
+
+        # M·w via FFT convolution (grad flows through M_hat → kernel)
+        result_hat = torch.einsum('ijxyz,jpxyz->ipxyz', M_hat_c128, w_hat)
+
+        result_grid = torch.fft.ifftn(result_hat, dim=(2, 3, 4))  # (3, P, gx, gy, gz)
+
+        # Gather from dipole positions
+        Mw = result_grid[:, :, pi, pj, pk]  # (3, P, N)
+        Mw = Mw.permute(2, 0, 1).reshape(n, P)  # (n, P)
+
+        # Loss: ||M·A·z - z||² / ||z||²
+        z_target = z.to(Mw.dtype)
+        residual = Mw - z_target
+        res_norm_sq = (residual.real.pow(2) + residual.imag.pow(2)).sum(dim=0)  # (P,)
+        z_norm_sq = (z_target.real.pow(2) + z_target.imag.pow(2)).sum(dim=0)    # (P,)
+
+        ratio = res_norm_sq / (z_norm_sq + 1e-8)  # (P,)
+        if log_loss:
+            loss = loss + torch.log(ratio + 1e-8).sum()
+        else:
+            loss = loss + ratio.sum()
+        total_probes += P
+
+    return loss / total_probes
 
 
 # ---------------------------------------------------------------------------
@@ -360,10 +424,11 @@ def conv_sai_bicgstab_loss(model, kernel, fft_matvec, num_iters=30, num_rhs=2):
 # Batched helpers (differentiable)
 # ---------------------------------------------------------------------------
 
-def _apply_M_batched(M_hat, v, fft_matvec):
+def _apply_M_batched(M_hat, v, fft_matvec, probe_chunk=2):
     """Apply preconditioner M to batched vectors v: (n, P) -> (n, P).
 
     Differentiable through M_hat. v can also carry gradients.
+    probe_chunk: process this many probes at a time to limit memory.
     """
     N = fft_matvec.N
     n = fft_matvec.n
@@ -379,25 +444,32 @@ def _apply_M_batched(M_hat, v, fft_matvec):
     pi, pj, pk = pos[:, 0], pos[:, 1], pos[:, 2]
     device = M_hat.device
 
-    v_reshaped = v.reshape(N, 3, P)
-    v_grid = torch.zeros(3, P, gx, gy, gz, dtype=torch.complex128, device=device)
-    v_grid[:, :, pi, pj, pk] = v_reshaped.permute(1, 2, 0)
-
-    v_hat = torch.fft.fftn(v_grid, dim=(2, 3, 4))
-
     M_hat_c128 = M_hat.to(torch.complex128)
-    result_hat = torch.einsum('ijxyz,jpxyz->ipxyz', M_hat_c128, v_hat)
 
-    result_grid = torch.fft.ifftn(result_hat, dim=(2, 3, 4))
+    results = []
+    for start in range(0, P, probe_chunk):
+        end = min(start + probe_chunk, P)
+        Pc = end - start
 
-    result = result_grid[:, :, pi, pj, pk]  # (3, P, N)
-    return result.permute(2, 0, 1).reshape(n, P)
+        v_c = v[:, start:end].reshape(N, 3, Pc)
+        v_grid = torch.zeros(3, Pc, gx, gy, gz, dtype=torch.complex128, device=device)
+        v_grid[:, :, pi, pj, pk] = v_c.permute(1, 2, 0)
+
+        v_hat = torch.fft.fftn(v_grid, dim=(2, 3, 4))
+        result_hat = torch.einsum('ijxyz,jpxyz->ipxyz', M_hat_c128, v_hat)
+        result_grid = torch.fft.ifftn(result_hat, dim=(2, 3, 4))
+
+        rc = result_grid[:, :, pi, pj, pk].permute(2, 0, 1).reshape(n, Pc)
+        results.append(rc)
+
+    return torch.cat(results, dim=1)
 
 
-def _apply_A_batched(v, fft_matvec):
+def _apply_A_batched(v, fft_matvec, probe_chunk=2):
     """Apply A·v for batched vectors: (n, P) -> (n, P).
 
     Differentiable through v. Uses out-of-place ops for autograd safety.
+    probe_chunk: process this many probes at a time to limit memory.
     """
     N = fft_matvec.N
     n = fft_matvec.n
@@ -413,31 +485,53 @@ def _apply_A_batched(v, fft_matvec):
     pi, pj, pk = pos[:, 0], pos[:, 1], pos[:, 2]
     device = v.device
 
-    v_reshaped = v.reshape(N, 3, P)
-    v_grid = torch.zeros(3, P, gx, gy, gz, dtype=torch.complex128, device=device)
-    v_grid[:, :, pi, pj, pk] = v_reshaped.permute(1, 2, 0)
-
-    v_hat = torch.fft.fftn(v_grid, dim=(2, 3, 4))
-
     D = fft_matvec.D_hat  # (6, gx, gy, gz)
-    # Out-of-place: avoid in-place assignment issues
-    y0 = D[0].unsqueeze(0)*v_hat[0] + D[1].unsqueeze(0)*v_hat[1] + D[2].unsqueeze(0)*v_hat[2]
-    y1 = D[1].unsqueeze(0)*v_hat[0] + D[3].unsqueeze(0)*v_hat[1] + D[4].unsqueeze(0)*v_hat[2]
-    y2 = D[2].unsqueeze(0)*v_hat[0] + D[4].unsqueeze(0)*v_hat[1] + D[5].unsqueeze(0)*v_hat[2]
-    y_hat = torch.stack([y0, y1, y2], dim=0)  # (3, P, gx, gy, gz)
 
-    y_grid = torch.fft.ifftn(y_hat, dim=(2, 3, 4))
-    conv = y_grid[:, :, pi, pj, pk].permute(2, 0, 1).reshape(n, P)
+    results = []
+    for start in range(0, P, probe_chunk):
+        end = min(start + probe_chunk, P)
+        Pc = end - start
 
-    return v - fft_matvec.alpha * conv
+        v_c = v[:, start:end].reshape(N, 3, Pc)
+        v_grid = torch.zeros(3, Pc, gx, gy, gz, dtype=torch.complex128, device=device)
+        v_grid[:, :, pi, pj, pk] = v_c.permute(1, 2, 0)
+
+        v_hat = torch.fft.fftn(v_grid, dim=(2, 3, 4))
+
+        y0 = D[0].unsqueeze(0)*v_hat[0] + D[1].unsqueeze(0)*v_hat[1] + D[2].unsqueeze(0)*v_hat[2]
+        y1 = D[1].unsqueeze(0)*v_hat[0] + D[3].unsqueeze(0)*v_hat[1] + D[4].unsqueeze(0)*v_hat[2]
+        y2 = D[2].unsqueeze(0)*v_hat[0] + D[4].unsqueeze(0)*v_hat[1] + D[5].unsqueeze(0)*v_hat[2]
+        y_hat = torch.stack([y0, y1, y2], dim=0)
+
+        y_grid = torch.fft.ifftn(y_hat, dim=(2, 3, 4))
+        conv = y_grid[:, :, pi, pj, pk].permute(2, 0, 1).reshape(n, Pc)
+
+        results.append(v[:, start:end] - fft_matvec.alpha * conv)
+
+    return torch.cat(results, dim=1)
 
 
 # ---------------------------------------------------------------------------
 # Adversarial probe loss
 # ---------------------------------------------------------------------------
 
+def _fft_matvec_chunked(fft_matvec, v, chunk=2):
+    """Apply fft_matvec to (n, P) in chunks to limit memory."""
+    P = v.shape[1] if v.dim() > 1 else 1
+    if P <= chunk:
+        return fft_matvec(v)
+    results = []
+    for s in range(0, P, chunk):
+        results.append(fft_matvec(v[:, s:min(s + chunk, P)]))
+    return torch.cat(results, dim=1)
+
+
 def conv_sai_adversarial_probe_loss(model, kernel, fft_matvec,
-                                     num_probes=5, adversarial_iters=10):
+                                     num_probes=5, adversarial_iters=10,
+                                     probe_chunk=2, log_loss=False,
+                                     m_hat_max_radius=None,
+                                     m_hat_threshold_rel=0.0,
+                                     m_hat_identity_blend=1.0):
     """Adversarial probe loss: find worst-case z via power iteration on (I-MA).
 
     Phase 1 (NO grad): power iteration finds z that maximizes ||MAz - z||/||z||.
@@ -446,12 +540,16 @@ def conv_sai_adversarial_probe_loss(model, kernel, fft_matvec,
     Focuses training on the worst eigenmodes of (I - MA), unlike random probes
     which optimize the average (Frobenius norm).
 
+    All batched FFT operations are chunked by probe_chunk to avoid OOM on
+    large grids (e.g. grid=128 → doubled 256³).
+
     Args:
         model: ConvSAI_MLP instance
         kernel: (n_stencil, 3, 3) complex — from model.forward(), WITH grad
         fft_matvec: FFTMatVec instance
         num_probes: number of adversarial vectors
         adversarial_iters: power iteration steps to find worst-case z
+        probe_chunk: number of probes per FFT chunk (lower = less memory)
 
     Returns:
         loss: scalar — probe loss on adversarial vectors
@@ -460,6 +558,12 @@ def conv_sai_adversarial_probe_loss(model, kernel, fft_matvec,
     device = kernel[0].device if isinstance(kernel, (list, tuple)) else kernel.device
 
     M_hat = model.build_M_hat(kernel, fft_matvec)
+    M_hat = _blend_M_hat_identity(M_hat, m_hat_identity_blend)
+    M_hat = _truncate_M_hat_spatial(
+        M_hat,
+        max_radius=m_hat_max_radius,
+        threshold_rel=m_hat_threshold_rel,
+    )
 
     # Phase 1: Find adversarial vectors via power iteration (NO grad)
     with torch.no_grad():
@@ -468,9 +572,8 @@ def conv_sai_adversarial_probe_loss(model, kernel, fft_matvec,
         z = z / torch.linalg.vector_norm(z, dim=0, keepdim=True)
 
         for _ in range(adversarial_iters):
-            # w = (I - MA)·z
-            Az = fft_matvec(z)
-            MAz = _apply_M_batched(M_hat_det, Az, fft_matvec)
+            Az = _fft_matvec_chunked(fft_matvec, z, probe_chunk)
+            MAz = _apply_M_batched(M_hat_det, Az, fft_matvec, probe_chunk)
             w = z - MAz
             norms = torch.linalg.vector_norm(w, dim=0, keepdim=True)
             z = w / (norms + 1e-30)
@@ -479,10 +582,10 @@ def conv_sai_adversarial_probe_loss(model, kernel, fft_matvec,
 
     # Phase 2: Compute probe loss on adversarial vectors (WITH grad)
     with torch.no_grad():
-        w = fft_matvec(z)  # A·z, no grad
+        w = _fft_matvec_chunked(fft_matvec, z, probe_chunk)
 
-    # M·(A·z) with grad through M_hat
-    Mw = _apply_M_batched(M_hat, w, fft_matvec)
+    # M·(A·z) with grad through M_hat (chunked)
+    Mw = _apply_M_batched(M_hat, w, fft_matvec, probe_chunk)
 
     # Loss: ||MA·z - z||² / ||z||²
     z_target = z.to(Mw.dtype)
@@ -490,7 +593,11 @@ def conv_sai_adversarial_probe_loss(model, kernel, fft_matvec,
     res_norm_sq = (residual.real.pow(2) + residual.imag.pow(2)).sum(dim=0)
     z_norm_sq = (z_target.real.pow(2) + z_target.imag.pow(2)).sum(dim=0)
 
-    loss = (res_norm_sq / (z_norm_sq + 1e-8)).mean()
+    ratio = res_norm_sq / (z_norm_sq + 1e-8)
+    if log_loss:
+        loss = torch.log(ratio + 1e-8).mean()
+    else:
+        loss = ratio.mean()
     return loss
 
 
@@ -711,3 +818,317 @@ def conv_sai_spectral_loss(model, kernel, fft_matvec,
         total_loss = total_loss + spectral_sq
 
     return total_loss / num_vectors
+
+def conv_sai_krylov_loss(model, kernel, fft_matvec, num_iters=10, num_rhs=2,
+                         m_hat_max_radius=None, m_hat_threshold_rel=0.0,
+                         m_hat_identity_blend=1.0):
+    """True-residual Krylov path loss.
+
+    The previous variant propagated the preconditioned residual
+    ``r <- (I - M A) r`` starting from ``r0 = M b``. That objective is
+    vulnerable to the degenerate solution ``M ~= 0``: the model can make the
+    preconditioned residual tiny without improving the original linear system.
+
+    This loss follows the true residual of a preconditioned Richardson/Krylov
+    step instead:
+
+        x_{k+1} = x_k + M r_k
+        r_{k+1} = r_k - A M r_k
+
+    Now ``M = 0`` leaves ``r`` unchanged and receives no artificial reward.
+    """
+    n = fft_matvec.n
+    device = kernel[0].device if isinstance(kernel, (list, tuple)) else kernel.device
+    M_hat = model.build_M_hat(kernel, fft_matvec)
+    M_hat = _blend_M_hat_identity(M_hat, m_hat_identity_blend)
+    M_hat = _truncate_M_hat_spatial(
+        M_hat,
+        max_radius=m_hat_max_radius,
+        threshold_rel=m_hat_threshold_rel,
+    )
+
+    total_loss = torch.tensor(0.0, device=device)
+    for _ in range(num_rhs):
+        b = torch.randn(n, dtype=torch.complex128, device=device)
+        b = b / torch.linalg.vector_norm(b)
+
+        r = b
+        r0_norm = torch.linalg.vector_norm(r).detach()
+        path_loss = torch.tensor(0.0, device=device)
+        for _ in range(num_iters):
+            Mr = _apply_M_conv(M_hat, r, fft_matvec)
+            AMr = _apply_A_batched(Mr.unsqueeze(1), fft_matvec).squeeze(1)
+            r = r - AMr
+
+            ratio = torch.linalg.vector_norm(r) / (r0_norm + 1e-30)
+            path_loss = path_loss + torch.log(ratio + 1e-12)
+
+        total_loss = total_loss + path_loss / num_iters
+
+    return total_loss / num_rhs
+
+
+def conv_sai_anchored_krylov_loss(model, kernel, fft_matvec,
+                                  num_iters=4, num_rhs=1,
+                                  num_probes=1, probe_chunk=1,
+                                  krylov_weight=1.0,
+                                  probe_weight=0.5,
+                                  right_probe_weight=0.2,
+                                  m_hat_max_radius=None,
+                                  m_hat_threshold_rel=0.0,
+                                  m_hat_identity_blend=1.0):
+    """True-residual Krylov loss with inverse-quality anchors.
+
+    The Krylov term optimizes residual reduction of the original system:
+    ``r <- r - A(M r)``. The probe anchors keep the learned operator close to
+    an actual inverse from both sides:
+
+      - left:  ``M A z ~= z``
+      - right: ``A M z ~= z``
+
+    All terms use log normalized residuals, so ``M ~= 0`` scores around zero
+    instead of looking artificially good.
+    """
+    n = fft_matvec.n
+    device = kernel[0].device if isinstance(kernel, (list, tuple)) else kernel.device
+    M_hat = model.build_M_hat(kernel, fft_matvec)
+    M_hat = _blend_M_hat_identity(M_hat, m_hat_identity_blend)
+    M_hat = _truncate_M_hat_spatial(
+        M_hat,
+        max_radius=m_hat_max_radius,
+        threshold_rel=m_hat_threshold_rel,
+    )
+
+    total_krylov = torch.tensor(0.0, device=device)
+    for _ in range(num_rhs):
+        b = torch.randn(n, dtype=torch.complex128, device=device)
+        b = b / torch.linalg.vector_norm(b)
+
+        r = b
+        r0_norm = torch.linalg.vector_norm(r).detach()
+        path_loss = torch.tensor(0.0, device=device)
+        for _ in range(num_iters):
+            Mr = _apply_M_conv(M_hat, r, fft_matvec)
+            AMr = _apply_A_batched(Mr.unsqueeze(1), fft_matvec,
+                                   probe_chunk=probe_chunk).squeeze(1)
+            r = r - AMr
+
+            ratio = torch.linalg.vector_norm(r) / (r0_norm + 1e-30)
+            path_loss = path_loss + torch.log(ratio + 1e-12)
+
+        total_krylov = total_krylov + path_loss / num_iters
+    krylov_loss = total_krylov / num_rhs
+
+    left_loss = torch.tensor(0.0, device=device)
+    right_loss = torch.tensor(0.0, device=device)
+    if num_probes > 0 and (probe_weight != 0.0 or right_probe_weight != 0.0):
+        z = torch.randn(n, num_probes, dtype=torch.complex128, device=device)
+        z = z / torch.linalg.vector_norm(z, dim=0, keepdim=True)
+
+        if probe_weight != 0.0:
+            with torch.no_grad():
+                Az = _fft_matvec_chunked(fft_matvec, z, chunk=probe_chunk)
+            MAz = _apply_M_batched(M_hat, Az, fft_matvec, probe_chunk=probe_chunk)
+            left_res = MAz - z.to(MAz.dtype)
+            left_num = (left_res.real.square() + left_res.imag.square()).sum(dim=0)
+            left_den = (z.real.square() + z.imag.square()).sum(dim=0)
+            left_loss = torch.log(left_num / (left_den + 1e-30) + 1e-12).mean()
+
+        if right_probe_weight != 0.0:
+            Mz = _apply_M_batched(M_hat, z, fft_matvec, probe_chunk=probe_chunk)
+            AMz = _apply_A_batched(Mz, fft_matvec, probe_chunk=probe_chunk)
+            right_res = AMz - z.to(AMz.dtype)
+            right_num = (right_res.real.square() + right_res.imag.square()).sum(dim=0)
+            right_den = (z.real.square() + z.imag.square()).sum(dim=0)
+            right_loss = torch.log(right_num / (right_den + 1e-30) + 1e-12).mean()
+
+    return (krylov_weight * krylov_loss
+            + probe_weight * left_loss
+            + right_probe_weight * right_loss)
+
+
+def _planewave_rhs(fft_matvec, prop_dir, pol_dir, device):
+    """Build ADDA default plane-wave RHS for a given polarization."""
+    positions = fft_matvec.positions.to(device=device, dtype=torch.float64)
+    real_dtype = torch.float64
+
+    prop = torch.tensor(prop_dir, dtype=real_dtype, device=device)
+    prop = prop / torch.linalg.vector_norm(prop)
+
+    pol = torch.tensor(pol_dir, dtype=real_dtype, device=device)
+    pol = pol - torch.dot(pol, prop) * prop
+    pol = pol / torch.linalg.vector_norm(pol)
+
+    phase_arg = fft_matvec.k * fft_matvec.d * (positions @ prop)
+    phase = torch.exp(1j * phase_arg).to(torch.complex128)
+
+    b = torch.zeros(positions.shape[0], 3, dtype=torch.complex128, device=device)
+    b[:, 0] = pol[0].to(torch.complex128) * phase
+    b[:, 1] = pol[1].to(torch.complex128) * phase
+    b[:, 2] = pol[2].to(torch.complex128) * phase
+    b = b.reshape(-1)
+    return b / (torch.linalg.vector_norm(b) + 1e-30)
+
+
+def conv_sai_planewave_krylov_loss(model, kernel, fft_matvec,
+                                   num_iters=8,
+                                   num_probes=1, probe_chunk=1,
+                                   krylov_weight=1.0,
+                                   probe_weight=0.5,
+                                   right_probe_weight=0.5,
+                                   m_hat_max_radius=None,
+                                   m_hat_threshold_rel=0.0,
+                                   m_hat_identity_blend=1.0):
+    """True-residual Krylov loss on ADDA's default plane-wave RHS.
+
+    ADDA's default fixed-orientation solve uses propagation along z and two
+    transverse incident polarizations. Random-RHS losses can improve a generic
+    surrogate while still leaving the actual plane-wave solve stuck; this loss
+    optimizes the residual path for those real right-hand sides directly.
+    """
+    n = fft_matvec.n
+    device = kernel[0].device if isinstance(kernel, (list, tuple)) else kernel.device
+    M_hat = model.build_M_hat(kernel, fft_matvec)
+    M_hat = _blend_M_hat_identity(M_hat, m_hat_identity_blend)
+    M_hat = _truncate_M_hat_spatial(
+        M_hat,
+        max_radius=m_hat_max_radius,
+        threshold_rel=m_hat_threshold_rel,
+    )
+
+    rhs_list = [
+        _planewave_rhs(fft_matvec, (0.0, 0.0, 1.0), (1.0, 0.0, 0.0), device),
+        _planewave_rhs(fft_matvec, (0.0, 0.0, 1.0), (0.0, 1.0, 0.0), device),
+    ]
+
+    total_krylov = torch.tensor(0.0, device=device)
+    for b in rhs_list:
+        r = b
+        r0_norm = torch.linalg.vector_norm(r).detach()
+        path_loss = torch.tensor(0.0, device=device)
+        for _ in range(num_iters):
+            Mr = _apply_M_conv(M_hat, r, fft_matvec)
+            AMr = _apply_A_batched(Mr.unsqueeze(1), fft_matvec,
+                                   probe_chunk=probe_chunk).squeeze(1)
+            r = r - AMr
+            ratio = torch.linalg.vector_norm(r) / (r0_norm + 1e-30)
+            path_loss = path_loss + torch.log(ratio + 1e-12)
+        total_krylov = total_krylov + path_loss / num_iters
+    krylov_loss = total_krylov / len(rhs_list)
+
+    left_loss = torch.tensor(0.0, device=device)
+    right_loss = torch.tensor(0.0, device=device)
+    if num_probes > 0 and (probe_weight != 0.0 or right_probe_weight != 0.0):
+        z = torch.randn(n, num_probes, dtype=torch.complex128, device=device)
+        z = z / torch.linalg.vector_norm(z, dim=0, keepdim=True)
+
+        if probe_weight != 0.0:
+            with torch.no_grad():
+                Az = _fft_matvec_chunked(fft_matvec, z, chunk=probe_chunk)
+            MAz = _apply_M_batched(M_hat, Az, fft_matvec, probe_chunk=probe_chunk)
+            left_res = MAz - z.to(MAz.dtype)
+            left_num = (left_res.real.square() + left_res.imag.square()).sum(dim=0)
+            left_den = (z.real.square() + z.imag.square()).sum(dim=0)
+            left_loss = torch.log(left_num / (left_den + 1e-30) + 1e-12).mean()
+
+        if right_probe_weight != 0.0:
+            Mz = _apply_M_batched(M_hat, z, fft_matvec, probe_chunk=probe_chunk)
+            AMz = _apply_A_batched(Mz, fft_matvec, probe_chunk=probe_chunk)
+            right_res = AMz - z.to(AMz.dtype)
+            right_num = (right_res.real.square() + right_res.imag.square()).sum(dim=0)
+            right_den = (z.real.square() + z.imag.square()).sum(dim=0)
+            right_loss = torch.log(right_num / (right_den + 1e-30) + 1e-12).mean()
+
+    return (krylov_weight * krylov_loss
+            + probe_weight * left_loss
+            + right_probe_weight * right_loss)
+
+
+def conv_sai_planewave_bicgstab_loss(model, kernel, fft_matvec,
+                                     num_iters=12,
+                                     num_probes=1, probe_chunk=1,
+                                     krylov_weight=1.0,
+                                     probe_weight=0.5,
+                                     right_probe_weight=0.5,
+                                     m_hat_max_radius=None,
+                                     m_hat_threshold_rel=0.0,
+                                     m_hat_identity_blend=1.0):
+    """Unrolled left-preconditioned BiCGStab loss on ADDA plane-wave RHS."""
+    n = fft_matvec.n
+    device = kernel[0].device if isinstance(kernel, (list, tuple)) else kernel.device
+    M_hat = model.build_M_hat(kernel, fft_matvec)
+    M_hat = _blend_M_hat_identity(M_hat, m_hat_identity_blend)
+    M_hat = _truncate_M_hat_spatial(
+        M_hat,
+        max_radius=m_hat_max_radius,
+        threshold_rel=m_hat_threshold_rel,
+    )
+    eps = 1e-30
+
+    rhs_list = [
+        _planewave_rhs(fft_matvec, (0.0, 0.0, 1.0), (1.0, 0.0, 0.0), device),
+        _planewave_rhs(fft_matvec, (0.0, 0.0, 1.0), (0.0, 1.0, 0.0), device),
+    ]
+
+    total = torch.tensor(0.0, device=device)
+    for b in rhs_list:
+        r = b.clone()
+        r_hat = _apply_M_conv(M_hat, r, fft_matvec)
+        r_hat_0 = (r_hat.real.square().sum() + r_hat.imag.square().sum()).detach()
+        r_tilde = r_hat.detach().clone()
+
+        rho = torch.tensor(1.0, dtype=torch.complex128, device=device)
+        alpha = torch.tensor(1.0, dtype=torch.complex128, device=device)
+        omega = torch.tensor(1.0, dtype=torch.complex128, device=device)
+        v_vec = torch.zeros(n, dtype=torch.complex128, device=device)
+        p = torch.zeros(n, dtype=torch.complex128, device=device)
+
+        for _ in range(num_iters):
+            rho_new = torch.dot(r_tilde.conj(), r_hat)
+            beta = (rho_new / (rho + eps)) * (alpha / (omega + eps))
+            p = r_hat + beta * (p - omega * v_vec)
+
+            Ap = _fft_matvec_chunked(fft_matvec, p.unsqueeze(1),
+                                     chunk=probe_chunk).squeeze(1)
+            v_vec = _apply_M_conv(M_hat, Ap, fft_matvec)
+            alpha = rho_new / (torch.dot(r_tilde.conj(), v_vec) + eps)
+            s = r_hat - alpha * v_vec
+
+            As = _fft_matvec_chunked(fft_matvec, s.unsqueeze(1),
+                                     chunk=probe_chunk).squeeze(1)
+            t = _apply_M_conv(M_hat, As, fft_matvec)
+            omega = torch.dot(t.conj(), s) / (torch.dot(t.conj(), t) + eps)
+            r_hat = s - omega * t
+            rho = rho_new
+
+        r_hat_k = r_hat.real.square().sum() + r_hat.imag.square().sum()
+        total = total + torch.log(r_hat_k / (r_hat_0 + eps) + eps)
+
+    bicg_loss = total / len(rhs_list)
+
+    left_loss = torch.tensor(0.0, device=device)
+    right_loss = torch.tensor(0.0, device=device)
+    if num_probes > 0 and (probe_weight != 0.0 or right_probe_weight != 0.0):
+        z = torch.randn(n, num_probes, dtype=torch.complex128, device=device)
+        z = z / torch.linalg.vector_norm(z, dim=0, keepdim=True)
+
+        if probe_weight != 0.0:
+            with torch.no_grad():
+                Az = _fft_matvec_chunked(fft_matvec, z, chunk=probe_chunk)
+            MAz = _apply_M_batched(M_hat, Az, fft_matvec, probe_chunk=probe_chunk)
+            left_res = MAz - z.to(MAz.dtype)
+            left_num = (left_res.real.square() + left_res.imag.square()).sum(dim=0)
+            left_den = (z.real.square() + z.imag.square()).sum(dim=0)
+            left_loss = torch.log(left_num / (left_den + 1e-30) + 1e-12).mean()
+
+        if right_probe_weight != 0.0:
+            Mz = _apply_M_batched(M_hat, z, fft_matvec, probe_chunk=probe_chunk)
+            AMz = _apply_A_batched(Mz, fft_matvec, probe_chunk=probe_chunk)
+            right_res = AMz - z.to(AMz.dtype)
+            right_num = (right_res.real.square() + right_res.imag.square()).sum(dim=0)
+            right_den = (z.real.square() + z.imag.square()).sum(dim=0)
+            right_loss = torch.log(right_num / (right_den + 1e-30) + 1e-12).mean()
+
+    return (krylov_weight * bicg_loss
+            + probe_weight * left_loss
+            + right_probe_weight * right_loss)

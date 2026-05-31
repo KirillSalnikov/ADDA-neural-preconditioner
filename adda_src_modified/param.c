@@ -101,7 +101,7 @@ extern const double prIncRefl[3],prIncTran[3];
 extern const bool volcor_used;
 extern const char *sh_form_str1,*sh_form_str2;
 #ifndef SPARSE
-extern const int gr_N;
+extern const size_t gr_N;
 extern const double gr_vf_real;
 #endif //SPARSE
 extern const size_t mat_count[];
@@ -413,11 +413,13 @@ PARSE_FUNC(maxiter);
 PARSE_FUNC(no_reduced_fft);
 PARSE_FUNC(no_vol_cor);
 PARSE_FUNC(ntheta);
+PARSE_FUNC(one_pol_y);
 PARSE_FUNC(opt);
 PARSE_FUNC(orient);
 PARSE_FUNC(phi_integr);
 PARSE_FUNC(pol);
 PARSE_FUNC(precond);
+PARSE_FUNC(precond_init_only);
 PARSE_FUNC(prognosis);
 PARSE_FUNC(prop);
 PARSE_FUNC(recalc_resid);
@@ -572,7 +574,7 @@ static struct opt_struct options[]={
 		 * !!! If subarguments are added, second-to-last argument should be changed from 1 to UNDEF, and consistency
 		 * test for number of arguments should be implemented in PARSE_FUNC(int_surf) below.
 		 */
-	{PAR(iter),"{bcgs2|bicg|bicgstab|cgnr|csym|qmr|qmr2}","Sets the iterative solver.\n"
+		{PAR(iter),"{bcgs2|bicg|bicgstab|cgnr|csym|fgmres|qmr|qmr2}","Sets the iterative solver.\n"
 		"Default: qmr",1,NULL},
 		/* TO ADD NEW ITERATIVE SOLVER
 		 * add the short name, used to define the new iterative solver in the command line, to the list "{...}" in the
@@ -603,6 +605,8 @@ static struct opt_struct options[]={
 		"orientation averaging is not used, the range is extended to 360 degrees (with the same length of elementary "
 		"interval, i.e. number of intervals is doubled).\n"
 		"Default: from 90 to 720 depending on the size of the computational grid.",1,NULL},
+	{PAR(one_pol_y),"","Fast path: calculate only Y incident polarization and skip X polarization and Mueller/amplitude "
+		"matrices. Use this only when one-polarization fields or cross sections are sufficient.",0,NULL},
 	{PAR(opt),"{speed|mem}",
 		"Sets whether ADDA should optimize itself for maximum speed or for minimum memory usage.\n"
 		"Default: speed",1,NULL},
@@ -640,6 +644,8 @@ static struct opt_struct options[]={
 		 */
 	{PAR(precond),"<filename>","Load a SAI preconditioner from a binary .precond file and apply it as left "
 		"preconditioning in the iterative solver (M*A*x = M*b). The file is exported by export_sai_precond.py.",1,NULL},
+	{PAR(precond_init_only),"","Use the loaded preconditioner only once to build an initial guess x_0 += M*r_0, "
+		"then continue with the ordinary unpreconditioned iterative solver.",0,NULL},
 	{PAR(prognosis),"","Do not actually perform simulation (not even memory allocation) but only estimate the required "
 		"RAM. Implies '-test'.",0,NULL},
 	{PAR(prop),"<x> <y> <z>","Sets propagation direction of incident radiation, float. Normalization (to the unity "
@@ -1344,6 +1350,7 @@ PARSE_FUNC(iter)
 	else if (strcmp(argv[1],"bicgstab")==0) IterMethod=IT_BICGSTAB;
 	else if (strcmp(argv[1],"cgnr")==0) IterMethod=IT_CGNR;
 	else if (strcmp(argv[1],"csym")==0) IterMethod=IT_CSYM;
+	else if (strcmp(argv[1],"fgmres")==0) IterMethod=IT_FGMRES;
 	else if (strcmp(argv[1],"qmr")==0) IterMethod=IT_QMR_CS;
 	else if (strcmp(argv[1],"qmr2")==0) IterMethod=IT_QMR_CS_2;
 	/* TO ADD NEW ITERATIVE SOLVER
@@ -1476,6 +1483,14 @@ PARSE_FUNC(pol)
 PARSE_FUNC(precond)
 {
 	precond_filename=ScanStrError(argv[1],MAX_FNAME);
+}
+PARSE_FUNC(precond_init_only)
+{
+	precond_init_only=true;
+}
+PARSE_FUNC(one_pol_y)
+{
+	one_pol_y=true;
 }
 PARSE_FUNC(prognosis)
 {
@@ -2059,6 +2074,7 @@ void InitVariables(void)
 	store_ampl=false;
 	store_grans=false;
 	load_chpoint=false;
+	one_pol_y=false;
 	sh_granul=false;
 	symX=symY=symZ=symR=true;
 	anisotropy=false;
@@ -2197,6 +2213,13 @@ void VariablesInterconnect(void)
 	if (igt_eps==UNDEF) igt_eps=iter_eps;
 	// default polarizability formulation depends on rect_dip
 	if (PolRelation==(enum pol)UNDEF) PolRelation = rectDip ? POL_CLDR : POL_LDR;
+	if (one_pol_y) {
+		if (orient_avg) PrintError("'-one_pol_y' is incompatible with '-orient avg'");
+		if (phi_integr) PrintError("'-one_pol_y' is incompatible with '-phi_integr'");
+		if (store_scat_grid) PrintError("'-one_pol_y' is incompatible with '-store_scat_grid'");
+		store_mueller=false;
+		store_ampl=false;
+	}
 	// parameter incompatibilities
 	if (scat_plane && yzplane) PrintError("Currently '-scat_plane' and '-yz' cannot be used together.");
 	if (orient_avg) {
@@ -2494,7 +2517,7 @@ void PrintInfo(void)
 		fprintf(logfile,"shape: ");
 		fprintf(logfile,"%s "GFORM"%s\n",sh_form_str1,sizeX,sh_form_str2);
 #ifndef SPARSE
-		if (sh_granul) fprintf(logfile,"  domain %d is filled with %d granules of diameter "GFORMDEF"\n"
+		if (sh_granul) fprintf(logfile,"  domain %d is filled with %zu granules of diameter "GFORMDEF"\n"
 			"    volume fraction: specified - "GFORMDEF", actual - "GFORMDEF"\n",gr_mat+1,gr_N,gr_d,gr_vf,gr_vf_real);
 #endif // SPARSE
 		fprintf(logfile,"box dimensions: %ix%ix%i\n",boxX,boxY,boxZ);
@@ -2583,6 +2606,7 @@ void PrintInfo(void)
 			if (store_ampl) fprintf(logfile,"Calculating only amplitude scattering matrix\n");
 			else fprintf(logfile,"Calculating no scattering matrices\n");
 		}
+		if (one_pol_y) fprintf(logfile,"Fast one-polarization mode: only Y incident polarization is calculated\n");
 		// log polarizability relation
 		fprintf(logfile,"Polarizability relation: ");
 		switch (PolRelation) {
@@ -2669,10 +2693,11 @@ void PrintInfo(void)
 		switch (IterMethod) {
 			case IT_BCGS2: fprintf(logfile,"Enhanced Bi-CG Stabilized(2)\n"); break;
 			case IT_BICG_CS: fprintf(logfile,"Bi-CG (complex symmetric)\n"); break;
-			case IT_BICGSTAB: fprintf(logfile,"Bi-CG Stabilized\n"); break;
-			case IT_CGNR: fprintf(logfile,"CGNR\n"); break;
-			case IT_CSYM: fprintf(logfile,"CSYM\n"); break;
-			case IT_QMR_CS: fprintf(logfile,"QMR (complex symmetric)\n"); break;
+		case IT_BICGSTAB: fprintf(logfile,"Bi-CG Stabilized\n"); break;
+		case IT_CGNR: fprintf(logfile,"CGNR\n"); break;
+		case IT_CSYM: fprintf(logfile,"CSYM\n"); break;
+		case IT_FGMRES: fprintf(logfile,"Restarted flexible GMRES\n"); break;
+		case IT_QMR_CS: fprintf(logfile,"QMR (complex symmetric)\n"); break;
 			case IT_QMR_CS_2: fprintf(logfile,"2-term QMR (complex symmetric)\n"); break;
 		}
 		/* TO ADD NEW ITERATIVE SOLVER

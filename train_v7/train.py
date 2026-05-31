@@ -25,6 +25,7 @@ import argparse
 import pprint
 import time
 import math
+import re
 
 import numpy as np
 import torch
@@ -48,6 +49,9 @@ from neural_precond.loss import (
     conv_sai_adversarial_probe_loss,
     conv_sai_right_probe_loss,
     conv_sai_gmres_loss,
+    conv_sai_anchored_krylov_loss,
+    conv_sai_planewave_krylov_loss,
+    conv_sai_planewave_bicgstab_loss,
 )
 
 
@@ -116,13 +120,15 @@ class SquaredConvSAI(nn.Module):
 # ---------------------------------------------------------------------------
 # Random shape generation
 # ---------------------------------------------------------------------------
-SHAPE_TYPES = ['sphere', 'ellipsoid', 'cube', 'cylinder', 'capsule']
+SHAPE_TYPES = ['sphere', 'ellipsoid', 'cube', 'cylinder', 'capsule', 'hex_prism']
 
-# Weights: ellipsoids get more weight since they're the most diverse
-SHAPE_WEIGHTS = [0.15, 0.40, 0.15, 0.15, 0.15]
+# Weights: hex_prisms get 50% weight (primary target), rest shared
+SHAPE_WEIGHTS = [0.08, 0.18, 0.08, 0.08, 0.08, 0.50]
 
 
-def generate_random_shape(rng, grid, only_shape=None):
+def generate_random_shape(rng, grid, only_shape=None,
+                          hex_dl_min=0.3, hex_dl_max=2.0,
+                          include_hex_prism=True):
     """Generate random shape and return (positions, shape_name).
 
     Ellipsoids get random continuous aspect ratios — this is the key
@@ -133,7 +139,14 @@ def generate_random_shape(rng, grid, only_shape=None):
     if only_shape is not None:
         shape_type = only_shape
     else:
-        shape_type = rng.choice(SHAPE_TYPES, p=SHAPE_WEIGHTS)
+        if include_hex_prism:
+            shape_types = SHAPE_TYPES
+            weights = SHAPE_WEIGHTS
+        else:
+            shape_types = SHAPE_TYPES[:-1]
+            weights = np.asarray(SHAPE_WEIGHTS[:-1], dtype=np.float64)
+            weights = weights / weights.sum()
+        shape_type = rng.choice(shape_types, p=weights)
 
     if shape_type == 'sphere':
         positions = make_sphere_dipoles(grid)
@@ -158,6 +171,16 @@ def generate_random_shape(rng, grid, only_shape=None):
         positions = make_capsule_dipoles(grid)
         name = 'capsule'
 
+    elif shape_type == 'hex_prism':
+        # 6-sided prism with random D/L ratio
+        # D/L covers thin columns to flat discs by default, and can be
+        # narrowed for targeted fine-tuning around guarded validation cases.
+        dl_ratio = rng.uniform(hex_dl_min, hex_dl_max)
+        az = 1.0 / dl_ratio  # ADDA prism parameter is h/Dx.
+        from apps.export_universal_precond import make_generic_shape_dipoles
+        positions = make_generic_shape_dipoles('prism', grid, ay=6, az=az)
+        name = f'hex_DL{dl_ratio:.2f}'
+
     else:
         raise ValueError(f"Unknown shape: {shape_type}")
 
@@ -167,29 +190,59 @@ def generate_random_shape(rng, grid, only_shape=None):
 # ---------------------------------------------------------------------------
 # Fixed validation configs
 # ---------------------------------------------------------------------------
+def _hex(g, az):
+    from apps.export_universal_precond import make_generic_shape_dipoles
+    return make_generic_shape_dipoles('prism', g, ay=6, az=az)
+
 FIXED_VAL_CONFIGS_STANDARD = [
-    # (m_re, m_im, kd, shape_generator, grid, name)
-    (2.0, 0.0, 0.42, lambda g: make_sphere_dipoles(g), 10, 'sphere'),
-    (2.5, 0.0, 0.42, lambda g: make_sphere_dipoles(g), 10, 'sphere'),
-    (3.0, 0.0, 0.42, lambda g: make_sphere_dipoles(g), 12, 'sphere'),
-    (2.0, 0.0, 0.42, lambda g: make_cube_dipoles(g), 10, 'cube'),
-    (2.5, 0.0, 0.42, lambda g: make_cube_dipoles(g), 10, 'cube'),
-    (2.0, 0.0, 0.42, lambda g: make_ellipsoid_dipoles(g, (1.0, 1.0, 2.0)), 12, 'ell_1:1:2'),
-    (2.5, 0.0, 0.42, lambda g: make_ellipsoid_dipoles(g, (1.0, 1.0, 2.0)), 12, 'ell_1:1:2'),
-    (3.0, 0.0, 0.42, lambda g: make_ellipsoid_dipoles(g, (1.0, 1.0, 2.0)), 12, 'ell_1:1:2'),
-    (2.0, 0.0, 0.42, lambda g: make_ellipsoid_dipoles(g, (1.0, 1.0, 0.5)), 12, 'ell_1:1:0.5'),
-    (2.5, 0.0, 0.42, lambda g: make_ellipsoid_dipoles(g, (1.0, 1.0, 0.5)), 12, 'ell_1:1:0.5'),
-    (3.0, 0.0, 0.42, lambda g: make_ellipsoid_dipoles(g, (1.0, 1.0, 0.5)), 12, 'ell_1:1:0.5'),
-    (2.5, 0.0, 0.42, lambda g: make_ellipsoid_dipoles(g, (1.0, 0.8, 0.6)), 12, 'ell_1:0.8:0.6'),
-    (2.5, 0.0, 0.42, lambda g: make_ellipsoid_dipoles(g, (1.0, 1.0, 3.0)), 12, 'ell_1:1:3'),
-    (3.0, 0.0, 0.42, lambda g: make_ellipsoid_dipoles(g, (1.0, 1.0, 3.0)), 16, 'ell_1:1:3'),
-    (2.5, 0.0, 0.42, lambda g: make_ellipsoid_dipoles(g, (1.0, 0.7, 1.5)), 12, 'ell_1:0.7:1.5'),
-    (2.5, 0.0, 0.42, lambda g: make_cylinder_dipoles(g), 10, 'cylinder'),
-    (3.0, 0.0, 0.42, lambda g: make_cylinder_dipoles(g), 10, 'cylinder'),
-    (2.5, 0.0, 0.42, lambda g: make_capsule_dipoles(g), 10, 'capsule'),
-    # Unseen ellipsoid aspect ratios (test generalization)
-    (2.5, 0.0, 0.42, lambda g: make_ellipsoid_dipoles(g, (1.0, 0.5, 0.5)), 12, 'ell_unseen_0.5_0.5'),
-    (2.5, 0.0, 0.42, lambda g: make_ellipsoid_dipoles(g, (1.0, 0.9, 2.5)), 12, 'ell_unseen_0.9_2.5'),
+    # Small/Medium grids for fast feedback
+    (3.0, 0.0, 0.42, lambda g: make_sphere_dipoles(g), 24, 'sphere_g24'),
+    (3.0, 0.0, 0.42, lambda g: _hex(g, 1.0), 24, 'hex_DL1_g24'),
+
+    # Large grids - The real test for Spectral-128
+    (3.0, 0.0, 0.42, lambda g: make_sphere_dipoles(g), 48, 'sphere_g48'),
+    (3.0, 0.0, 0.42, lambda g: _hex(g, 1.0), 48, 'hex_DL1_g48'),
+    (3.0, 0.0, 0.42, lambda g: make_sphere_dipoles(g), 64, 'sphere_g64'),
+
+    # Hard physics
+    (3.5, 0.0, 0.42, lambda g: make_sphere_dipoles(g), 33, 'sphere_g33_m3.5'),
+]
+
+# Large-grid configs for g48+ spectral training. g12-g24 runs inline;
+# g48+ runs through ADDA MPI in validate_fixed().
+FIXED_VAL_CONFIGS_LARGE = [
+    # Small/medium grids for inline validation (g12-24, fast on CPU)
+    (3.0, 0.0, 0.42, lambda g: make_sphere_dipoles(g), 12, 'sphere_g12'),
+    (3.0, 0.0, 0.42, lambda g: _hex(g, 1.0), 12, 'hex_DL1_g12'),
+    (3.0, 0.0, 0.42, lambda g: _hex(g, 0.5), 12, 'hex_DL2_g12'),
+    (3.0, 0.0, 0.42, lambda g: make_sphere_dipoles(g), 24, 'sphere_g24'),
+    (3.0, 0.0, 0.42, lambda g: _hex(g, 1.0), 24, 'hex_DL1_g24'),
+    (3.0, 0.0, 0.42, lambda g: _hex(g, 0.5), 24, 'hex_DL2_g24'),
+    (3.5, 0.0, 0.42, lambda g: _hex(g, 1.0), 24, 'hex_DL1_g24_m3.5'),
+    (3.5, 0.0, 0.42, lambda g: make_sphere_dipoles(g), 24, 'sphere_g24_m3.5'),
+
+    # Real large-grid ADDA MPI checks. These are the target regime; without
+    # them a collapsed preconditioner can look acceptable on inline validation.
+    (3.0, 0.0, 0.42, lambda g: make_sphere_dipoles(g), 48, 'sphere_g48'),
+    (3.0, 0.0, 0.42, lambda g: _hex(g, 1.0), 48, 'hex_DL1_g48'),
+    (3.0, 0.0, 0.42, lambda g: _hex(g, 0.5), 48, 'hex_DL2_g48'),
+    (3.5, 0.0, 0.42, lambda g: make_sphere_dipoles(g), 48, 'sphere_g48_m3.5'),
+    (3.5, 0.0, 0.42, lambda g: _hex(g, 1.0), 48, 'hex_DL1_g48_m3.5'),
+    (3.0, 0.0, 0.42, lambda g: make_sphere_dipoles(g), 64, 'sphere_g64'),
+]
+
+FIXED_VAL_CONFIGS_GUARDED = [
+    # Fast inline checks below g48.
+    (3.0, 0.0, 0.42, lambda g: make_sphere_dipoles(g), 32, 'sphere_g32'),
+    (3.0, 0.0, 0.42, lambda g: _hex(g, 1.0), 32, 'hex_DL1_g32'),
+    (3.0, 0.0, 0.42, lambda g: _hex(g, 0.5), 32, 'hex_DL2_g32'),
+    (3.0, 0.0, 0.42, lambda g: make_sphere_dipoles(g), 40, 'sphere_g40'),
+    (3.0, 0.0, 0.42, lambda g: _hex(g, 1.0), 40, 'hex_DL1_g40'),
+    (3.0, 0.0, 0.42, lambda g: _hex(g, 0.5), 40, 'hex_DL2_g40'),
+
+    # Minimal large-grid gate through ADDA MPI.
+    (3.0, 0.0, 0.42, lambda g: make_sphere_dipoles(g), 48, 'sphere_g48'),
+    (3.0, 0.0, 0.42, lambda g: _hex(g, 1.0), 48, 'hex_DL1_g48'),
 ]
 
 # Validation configs for high-m regime (m=4-6), smaller kd for accuracy
@@ -282,6 +335,7 @@ def sample_parameters(rng, config, step=None, num_steps=None):
         current_grid_max = grid_max
 
     grid = rng.randint(grid_min, current_grid_max + 1)
+    if grid > 32: grid = (grid // 4) * 4  # Snap to multiples of 4 for fast FFT
     return m_re, m_im, kd, grid
 
 
@@ -304,96 +358,318 @@ def compute_loss(model, kernel, fft_mv, config):
     """Compute training loss based on config['loss'] setting."""
     loss_type = config['loss']
     num_probes = config.get('num_probes', 5)
+    spectral_truncate_radius = config.get('spectral_truncate_radius', None)
+    spectral_truncate_threshold_rel = config.get('spectral_truncate_threshold_rel', 0.0)
+    spectral_identity_blend = config.get('spectral_identity_blend', 1.0)
 
     if loss_type == 'probe':
-        return conv_sai_probe_loss(model, kernel, fft_mv, num_probes=num_probes)
+        loss = conv_sai_probe_loss(model, kernel, fft_mv, num_probes=num_probes)
     elif loss_type == 'adversarial':
-        return conv_sai_adversarial_probe_loss(
+        loss = conv_sai_adversarial_probe_loss(
             model, kernel, fft_mv,
             num_probes=num_probes,
             adversarial_iters=config.get('adversarial_iters', 10),
+            m_hat_max_radius=spectral_truncate_radius,
+            m_hat_threshold_rel=spectral_truncate_threshold_rel,
+            m_hat_identity_blend=spectral_identity_blend,
         )
     elif loss_type == 'right_probe':
-        return conv_sai_right_probe_loss(
+        loss = conv_sai_right_probe_loss(
             model, kernel, fft_mv, num_probes=num_probes,
         )
     elif loss_type == 'gmres':
-        return conv_sai_gmres_loss(
+        loss = conv_sai_gmres_loss(
             model, kernel, fft_mv,
             gmres_iters=config.get('gmres_iters', 10),
             num_rhs=config.get('gmres_rhs', 2),
         )
+    elif loss_type == 'krylov':
+        from neural_precond.loss import conv_sai_krylov_loss
+        loss = conv_sai_krylov_loss(
+            model, kernel, fft_mv,
+            num_iters=config.get('krylov_iters', 10),
+            num_rhs=config.get('krylov_rhs', 2),
+            m_hat_max_radius=spectral_truncate_radius,
+            m_hat_threshold_rel=spectral_truncate_threshold_rel,
+            m_hat_identity_blend=spectral_identity_blend,
+        )
+    elif loss_type == 'anchored_krylov':
+        loss = conv_sai_anchored_krylov_loss(
+            model, kernel, fft_mv,
+            num_iters=config.get('krylov_iters', 4),
+            num_rhs=config.get('krylov_rhs', 1),
+            num_probes=config.get('anchor_num_probes', 1),
+            probe_chunk=config.get('anchor_probe_chunk', 1),
+            krylov_weight=config.get('anchor_krylov_weight', 1.0),
+            probe_weight=config.get('anchor_probe_weight', 0.5),
+            right_probe_weight=config.get('anchor_right_probe_weight', 0.2),
+            m_hat_max_radius=spectral_truncate_radius,
+            m_hat_threshold_rel=spectral_truncate_threshold_rel,
+            m_hat_identity_blend=spectral_identity_blend,
+        )
+    elif loss_type == 'planewave_krylov':
+        loss = conv_sai_planewave_krylov_loss(
+            model, kernel, fft_mv,
+            num_iters=config.get('krylov_iters', 8),
+            num_probes=config.get('anchor_num_probes', 1),
+            probe_chunk=config.get('anchor_probe_chunk', 1),
+            krylov_weight=config.get('anchor_krylov_weight', 1.0),
+            probe_weight=config.get('anchor_probe_weight', 0.5),
+            right_probe_weight=config.get('anchor_right_probe_weight', 0.5),
+            m_hat_max_radius=spectral_truncate_radius,
+            m_hat_threshold_rel=spectral_truncate_threshold_rel,
+            m_hat_identity_blend=spectral_identity_blend,
+        )
+    elif loss_type == 'planewave_bicgstab':
+        loss = conv_sai_planewave_bicgstab_loss(
+            model, kernel, fft_mv,
+            num_iters=config.get('krylov_iters', 12),
+            num_probes=config.get('anchor_num_probes', 1),
+            probe_chunk=config.get('anchor_probe_chunk', 1),
+            krylov_weight=config.get('anchor_krylov_weight', 1.0),
+            probe_weight=config.get('anchor_probe_weight', 0.5),
+            right_probe_weight=config.get('anchor_right_probe_weight', 0.5),
+            m_hat_max_radius=spectral_truncate_radius,
+            m_hat_threshold_rel=spectral_truncate_threshold_rel,
+            m_hat_identity_blend=spectral_identity_blend,
+        )
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
+
+    correction_penalty_weight = config.get("spectral_correction_penalty", 0.0)
+    correction_penalty = getattr(model, "_last_correction_penalty", None)
+    if correction_penalty_weight and correction_penalty is not None:
+        loss = loss + float(correction_penalty_weight) * correction_penalty
+    return loss
+
+
+def translate_legacy_spectral_keys(state):
+    if any(k.startswith("freq_mlp.blocks.") for k in state):
+        return state
+    if "freq_mlp.proj_in.weight" not in state:
+        return state
+
+    translated = {}
+    extra_ids = sorted({
+        int(k.split(".")[2])
+        for k in state
+        if k.startswith("freq_mlp.extra.") and k.endswith(".weight")
+    })
+    out_idx = 2 * (len(extra_ids) + 1)
+
+    for key, value in state.items():
+        if key.startswith("freq_mlp.proj_in."):
+            key = key.replace("freq_mlp.proj_in.", "freq_mlp.0.")
+        elif key.startswith("freq_mlp.extra."):
+            parts = key.split(".")
+            extra_idx = int(parts[2])
+            seq_idx = 2 + 2 * extra_idx
+            key = f"freq_mlp.{seq_idx}.{parts[3]}"
+        elif key.startswith("freq_mlp.proj_out."):
+            key = key.replace("freq_mlp.proj_out.", f"freq_mlp.{out_idx}.")
+        translated[key] = value
+    return translated
 
 
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def validate_fixed(model, device, encoder_resolution, rtol=1e-5, max_iter=1000):
-    """Validate on FIXED configs with BiCGStab."""
+def _shape_from_val_name(name):
+    if name.startswith('hex_DL2'):
+        return 'prism', 6.0, 0.5, ['-shape', 'prism', '6', '0.5']
+    if name.startswith('hex'):
+        return 'prism', 6.0, 1.0, ['-shape', 'prism', '6', '1.0']
+    if name.startswith('cube'):
+        return 'cube', 1.0, 1.0, ['-shape', 'box']
+    if name.startswith('ell_1:1:0.5'):
+        return 'ellipsoid', 1.0, 0.5, ['-shape', 'ellipsoid', '1', '0.5']
+    if name.startswith('ell_1:1:2'):
+        return 'ellipsoid', 1.0, 2.0, ['-shape', 'ellipsoid', '1', '2']
+    return 'sphere', 1.0, 1.0, ['-shape', 'sphere']
+
+
+def _parse_adda_iters(output):
+    if isinstance(output, bytes):
+        output = output.decode('utf-8', errors='replace')
+    re_iters = [int(x) for x in re.findall(r"RE_(\d+)", output)]
+    if re_iters:
+        return max(re_iters)
+    iter_matches = [int(x) for x in re.findall(r"(?:iter\s+|iteration\s+)(\d+)", output, re.IGNORECASE)]
+    if iter_matches:
+        return iter_matches[-1]
+    return None
+
+
+def _run_adda_validation(config, grid, m_re, m_im, kd, shape_args, precond, maxiter):
+    import subprocess
+    import tempfile
+
+    dpl = 2 * math.pi / kd
+    np_mpi = str(config.get('adda_val_np', 16))
+    timeout = float(config.get('adda_val_timeout', 900))
+    adda_bin = config.get('adda_mpi_bin', 'adda/src/mpi/adda_mpi')
+    fftw_path = os.path.expanduser(config.get('fftw_lib_path', '~/.local/lib'))
+
+    with tempfile.TemporaryDirectory(prefix='adda_val_') as tmpdir:
+        cmd = [
+            'mpirun', '--oversubscribe', '-np', np_mpi,
+            '-x', f'LD_LIBRARY_PATH={fftw_path}',
+            adda_bin, '-grid', str(grid), '-m', str(m_re), str(m_im),
+            '-dpl', f'{dpl:.10g}', '-iter', 'bicgstab', '-eps', '5',
+            '-maxiter', str(maxiter), '-dir', tmpdir,
+        ] + shape_args
+        if precond:
+            cmd += ['-precond', precond]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout or ''
+            stderr = exc.stderr or ''
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode('utf-8', errors='replace')
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode('utf-8', errors='replace')
+            output = stdout + stderr
+            iters = _parse_adda_iters(output)
+            msg = f'timeout after {iters} parsed iterations' if iters is not None else 'timeout'
+            return maxiter, False, msg
+
+    output = result.stdout + result.stderr
+    iters = _parse_adda_iters(output)
+    hit_cap = iters is None or iters >= maxiter
+    ok = result.returncode == 0 and not hit_cap
+    return iters if ok else maxiter, ok, output[-400:]
+
+
+@torch.no_grad()
+def validate_fixed(model, config, device, encoder_resolution, rtol=1e-5,
+                   max_iter=1000, return_status=False):
+    """Validate on FIXED configs with BiCGStab.
+    Uses Python for small grids and ADDA MPI for large grids.
+    """
     from krylov.bicgstab import bicgstab
+    import subprocess
 
     model.eval()
-
     total_precond = 0
     total_unprecond = 0
     counted = 0
     details = []
+    guarded_required = set()
+    guarded_passed = set()
+    if config.get("guarded_val", False):
+        guarded_required = {cfg_name for *_, cfg_grid, cfg_name in FIXED_VAL_CONFIGS
+                            if cfg_grid >= 48}
+    guarded_min_speedup = config.get("guarded_min_large_speedup", 1.0)
 
     for m_re, m_im, kd, gen_fn, grid, name in FIXED_VAL_CONFIGS:
-        try:
-            positions = gen_fn(grid)
-            fft_mv = build_fft_matvec_from_positions(positions, m_re, m_im, kd, 'cpu')
-        except Exception:
-            continue
+        if grid < 48:
+            # --- Python Validation (Fast) ---
+            try:
+                positions = gen_fn(grid)
+                fft_mv = build_fft_matvec_from_positions(positions, m_re, m_im, kd, device)
+            except Exception: continue
 
-        n = fft_mv.n
+            n = fft_mv.n
+            def A_op(v):
+                return fft_mv(v.unsqueeze(1) if v.dim()==1 else v).squeeze(1)
 
-        def A_op(v):
-            v2d = v.unsqueeze(1) if v.dim() == 1 else v
-            return fft_mv(v2d).squeeze(1)
+            torch.manual_seed(42)
+            b = torch.randn(n, dtype=torch.complex128, device=device)
+            b = b / torch.linalg.vector_norm(b)
 
-        torch.manual_seed(hash((m_re, m_im, kd, name, grid)) % 2**31)
-        b = torch.randn(n, dtype=torch.complex128) + \
-            1j * torch.randn(n, dtype=torch.complex128)
-        b = b / torch.linalg.vector_norm(b)
+            occ_grid = positions_to_occupancy(positions, grid_size=None, device=device)
+            cond = model(m_re, m_im, kd, occ_grid, grid)
 
-        # Build occupancy grid and predict kernel
-        occ_grid = positions_to_occupancy(positions, grid_size=grid, device='cpu')
-        kernel = model(m_re, m_im, kd, occ_grid, grid)
-        precond_fn = model.make_precond_fn(kernel, fft_mv)
+            # Use GPU for validation if spectral
+            if hasattr(model, 'build_M_hat'):
+                M_hat = model.build_M_hat(cond, fft_mv)
+                def precond_fn(v):
+                    from neural_precond.loss import _apply_M_conv
+                    return _apply_M_conv(M_hat, v, fft_mv)
+            else:
+                precond_fn = model.make_precond_fn(cond, fft_mv)
 
-        res_p, _ = bicgstab(A_op, b, M=precond_fn, rtol=rtol, max_iter=max_iter)
-        res_u, _ = bicgstab(A_op, b, rtol=rtol, max_iter=max_iter)
+            res_p, _ = bicgstab(A_op, b, M=precond_fn, rtol=rtol, max_iter=max_iter)
+            res_u, _ = bicgstab(A_op, b, rtol=rtol, max_iter=max_iter)
+            ip, iu = len(res_p)-1, len(res_u)-1
+        else:
+            # --- ADDA MPI Validation (Realistic) ---
+            print(f"  [MPI Val] Running {name}...")
+            tmp_precond = f"/tmp/val_step_{grid}.precond"
+            shape, ay, az, shape_args = _shape_from_val_name(name)
+            try:
+                save_path = os.path.join(config['folder'], "tmp_val.pt")
+                torch.save(model.state_dict(), save_path)
+                export_identity_blend = config.get('export_identity_blend')
+                if export_identity_blend is None:
+                    export_identity_blend = config.get('spectral_identity_blend', 1.0)
 
-        ip = len(res_p) - 1
-        iu = len(res_u) - 1
+                export_cmd = [
+                    sys.executable, "apps/export_spectral_precond.py",
+                    "--checkpoint", save_path, "--grid", str(grid),
+                    "--m_re", str(m_re), "--m_im", str(m_im), "--kd", f"{kd:.10g}",
+                    "--shape", shape, "--ay", str(ay), "--az", str(az),
+                    "--threshold-rel", str(config.get('export_threshold_rel', 1e-8)),
+                    "--blend-identity", str(export_identity_blend),
+                    "--output", tmp_precond,
+                ]
+                export_max_radius = config.get('export_max_radius',
+                                               config.get('spectral_truncate_radius', None))
+                if export_max_radius is not None:
+                    export_cmd += ["--max-radius", str(export_max_radius)]
+                if config.get("spectral_normalize_inputs", False):
+                    export_cmd.append("--normalize-inputs")
+
+                res = subprocess.run(export_cmd, capture_output=True, text=True)
+                if res.returncode != 0 or not os.path.exists(tmp_precond):
+                    raise RuntimeError((res.stderr or res.stdout)[-500:])
+
+                base_max = int(config.get('adda_val_maxiter_base', 500))
+                prec_max = int(config.get('adda_val_maxiter_precond', 2000))
+                iu, ok_u, msg_u = _run_adda_validation(
+                    config, grid, m_re, m_im, kd, shape_args, None, base_max)
+                ip, ok_p, msg_p = _run_adda_validation(
+                    config, grid, m_re, m_im, kd, shape_args, tmp_precond, prec_max)
+                if not ok_u:
+                    print(f"    baseline capped/failed at {iu} iterations")
+                if not ok_p:
+                    print(f"    precond capped/failed at {ip} iterations: {msg_p}")
+                if name in guarded_required:
+                    large_speedup = iu / max(ip, 1)
+                    if ok_p and large_speedup >= guarded_min_speedup:
+                        guarded_passed.add(name)
+            except Exception as e:
+                print(f"    MPI Val failed: {e}")
+                continue
+
         total_precond += ip
         total_unprecond += iu
         counted += 1
         spd = iu / max(ip, 1)
-        details.append(f"{name} g{grid} m={m_re}+{m_im}i kd={kd:.2f}: "
-                       f"{iu}->{ip} ({spd:.1f}x)")
+        details.append(f"{name}: {iu}->{ip} ({spd:.1f}x)")
 
-    if counted == 0:
-        print("Validation: no valid configs")
-        return 1.0
-
-    avg_p = total_precond / counted
-    avg_u = total_unprecond / counted
+    avg_p = total_precond / max(counted, 1)
+    avg_u = total_unprecond / max(counted, 1)
     speedup = avg_u / max(avg_p, 1)
-    inv_speedup = avg_p / max(avg_u, 1)
-
-    print(f"Validation fixed ({counted} configs)\t"
-          f"precond: {avg_p:.1f}\t unprecond: {avg_u:.1f}\t speedup: {speedup:.2f}x")
-
-    worst = sorted(details, key=lambda s: float(s.split('(')[1].split('x')[0]))
-    for w in worst[:3]:
-        print(f"  worst: {w}")
-
-    return inv_speedup
+    print(f"Validation ({counted} configs) speedup: {speedup:.2f}x")
+    if details:
+        print("  " + " | ".join(details))
+    metric = avg_p / max(avg_u, 1)
+    ok_for_best = True
+    if guarded_required:
+        missing = sorted(guarded_required - guarded_passed)
+        ok_for_best = len(missing) == 0
+        if ok_for_best:
+            print("  Guarded best gate: PASS")
+        else:
+            print("  Guarded best gate: FAIL; required large-grid ADDA cases "
+                  f"did not pass: {', '.join(missing)}")
+    if return_status:
+        return metric, ok_for_best
+    return metric
 
 
 @torch.no_grad()
@@ -412,9 +688,15 @@ def validate_probe(model, rng, config, device, num_val_steps=50):
     for _ in range(num_val_steps):
         m_re, m_im, kd, grid = sample_parameters(rng, val_config)
         try:
-            positions, _ = generate_random_shape(rng, grid)
+            positions, _ = generate_random_shape(
+                rng, grid,
+                only_shape=config.get('only_shape'),
+                hex_dl_min=config.get('hex_dl_min', 0.3),
+                hex_dl_max=config.get('hex_dl_max', 2.0),
+                include_hex_prism=not config.get('no_hex_prism', False),
+            )
             fft_mv = build_fft_matvec_from_positions(positions, m_re, m_im, kd, device)
-            occ_grid = positions_to_occupancy(positions, grid_size=grid, device=device)
+            occ_grid = positions_to_occupancy(positions, grid_size=None, device=device)
             kernel = model(m_re, m_im, kd, occ_grid, grid)
             loss = conv_sai_probe_loss(model, kernel, fft_mv, num_probes=10)
             total_loss += loss.item()
@@ -454,11 +736,50 @@ def main(config):
             activation=config.get("activation", "relu"),
             squared=config.get("squared_kernel", False),
             freq_coords=not config.get("no_freq_coords", False),
+            freq_residual_blocks=config.get("freq_residual_blocks", 0),
+            correction_hidden=config.get("spectral_correction_hidden", 0),
+            correction_layers=config.get("spectral_correction_layers", 2),
+            correction_scale=config.get("spectral_correction_scale", 1.0),
+            transformer_tokens=config.get("spectral_transformer_tokens", 0),
+            transformer_dim=config.get("spectral_transformer_dim", 128),
+            transformer_layers=config.get("spectral_transformer_layers", 2),
+            transformer_heads=config.get("spectral_transformer_heads", 4),
+            transformer_scale=config.get("spectral_transformer_scale", 1.0),
+            freq_chunk_size=config.get("spectral_freq_chunk_size", 0),
+            freq_checkpoint_chunks=config.get("spectral_freq_checkpoint_chunks", False),
             encoder_resolution=encoder_resolution,
             encoder_channels=tuple(config.get("encoder_channels", [16, 32, 64])),
+            normalize_inputs=config.get("spectral_normalize_inputs", False),
+            m_re_min=config.get("m_re_min", 1.5),
+            m_re_max=config.get("m_re_max", 4.0),
+            m_im_min=config.get("m_im_min", 0.0),
+            m_im_max=config.get("m_im_max", 0.5),
+            kd_min=config.get("kd_min", 0.2),
+            kd_max=config.get("kd_max", 0.8),
+            log_grid_center=config.get("spectral_log_grid_center", 2.0),
+            log_grid_scale=config.get("spectral_log_grid_scale", 2.0),
         )
         print(f"Spectral: freq_hidden={config.get('freq_hidden', 64)}, "
-              f"freq_layers={config.get('freq_layers', 3)}")
+              f"freq_layers={config.get('freq_layers', 3)}, "
+              f"freq_residual_blocks={config.get('freq_residual_blocks', 0)}, "
+              f"correction_hidden={config.get('spectral_correction_hidden', 0)}, "
+              f"correction_layers={config.get('spectral_correction_layers', 2)}, "
+              f"correction_scale={config.get('spectral_correction_scale', 1.0)}, "
+              f"correction_penalty={config.get('spectral_correction_penalty', 0.0)}, "
+              f"transformer_tokens={config.get('spectral_transformer_tokens', 0)}, "
+              f"transformer_dim={config.get('spectral_transformer_dim', 128)}, "
+              f"transformer_layers={config.get('spectral_transformer_layers', 2)}, "
+              f"transformer_heads={config.get('spectral_transformer_heads', 4)}, "
+              f"transformer_scale={config.get('spectral_transformer_scale', 1.0)}, "
+              f"normalize_inputs={config.get('spectral_normalize_inputs', False)}, "
+              f"freq_chunk_size={config.get('spectral_freq_chunk_size', 0)}, "
+              f"checkpoint_chunks={config.get('spectral_freq_checkpoint_chunks', False)}")
+        if (config.get("spectral_truncate_radius") is not None
+                or config.get("spectral_truncate_threshold_rel", 0.0) > 0.0):
+            print("Spectral train truncation: "
+                  f"radius={config.get('spectral_truncate_radius')} "
+                  f"threshold_rel={config.get('spectral_truncate_threshold_rel', 0.0)} "
+                  f"identity_blend={config.get('spectral_identity_blend', 1.0)}")
     elif config.get("hybrid", False):
         # Hybrid: pre-trained near (ConvSAI_Universal) + trainable far (Separable)
         near_model = ConvSAI_Universal(
@@ -546,13 +867,36 @@ def main(config):
 
     if config.get("resume"):
         state = torch.load(config["resume"], map_location="cpu", weights_only=True)
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        if missing and not unexpected:
+        if config.get("spectral", False):
+            state = translate_legacy_spectral_keys(state)
+        if isinstance(model, ConvSAI_Multigrid) and not any(k.startswith("base.") for k in state):
+            base_model.load_state_dict(state, strict=False)
+            print(f"Loaded base weights into multigrid base from {config['resume']}")
+        elif isinstance(model, SquaredConvSAI) and not any(k.startswith("base.") for k in state):
             base_model.load_state_dict(state, strict=False)
             print(f"Loaded base weights from {config['resume']}")
         else:
-            print(f"Loaded weights from {config['resume']} "
-                  f"(missing={len(missing)}, unexpected={len(unexpected)})")
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            if missing and not unexpected:
+                base_model.load_state_dict(state, strict=False)
+                print(f"Loaded base weights from {config['resume']}")
+            else:
+                print(f"Loaded weights from {config['resume']} "
+                      f"(missing={len(missing)}, unexpected={len(unexpected)})")
+
+    if (config.get("spectral_freeze_base", False)
+            and config.get("spectral", False)
+            and (getattr(model, "correction_mlp", None) is not None
+                 or getattr(model, "coarse_transformer", None) is not None)):
+        for name, param in model.named_parameters():
+            param.requires_grad = (
+                name.startswith("correction_mlp.")
+                or name.startswith("coarse_transformer.")
+            )
+        frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+        trainable_corr = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Spectral correction mode: frozen_base={frozen:,}, "
+              f"trainable_correction={trainable_corr:,}")
 
     model.to(device)
     loss_type = config['loss']
@@ -579,11 +923,20 @@ def main(config):
     print(f"Loss: {loss_type}")
     if loss_type == 'adversarial':
         print(f"  adversarial_iters: {config.get('adversarial_iters', 10)}")
+    elif loss_type in ('anchored_krylov', 'planewave_krylov', 'planewave_bicgstab'):
+        print(f"  krylov_iters: {config.get('krylov_iters', 4)}, "
+              f"rhs: {config.get('krylov_rhs', 1)}, "
+              f"probes: {config.get('anchor_num_probes', 1)}")
+        print(f"  weights: krylov={config.get('anchor_krylov_weight', 1.0)}, "
+              f"left={config.get('anchor_probe_weight', 0.5)}, "
+              f"right={config.get('anchor_right_probe_weight', 0.2)}")
     only = config.get('only_shape')
     if only:
         print(f"Shapes: {only} ONLY")
-    else:
+    elif config.get('no_hex_prism', False):
         print(f"Shapes: random (sphere, ellipsoid[continuous], cube, cylinder, capsule)")
+    else:
+        print(f"Shapes: random (sphere, ellipsoid[continuous], cube, cylinder, capsule, hex_prism)")
     print(f"Ranges: m_re=[{config['m_re_min']}, {config['m_re_max']}], "
           f"m_im=[{config['m_im_min']}, {config['m_im_max']}], "
           f"kd=[{config['kd_min']}, {config['kd_max']}]")
@@ -614,10 +967,11 @@ def main(config):
             ], weight_decay=config.get("weight_decay", 1e-4))
             print(f"Optimizer: base_lr={config['lr']}, coarse_lr={coarse_lr}")
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"],
+        train_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(train_params, lr=config["lr"],
                                        weight_decay=config.get("weight_decay", 1e-4))
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=config.get("patience", 500))
+        optimizer, mode="min", factor=0.5, patience=10)
 
     best_val = float("inf")
     logger = TrainResults(config['folder'])
@@ -648,13 +1002,18 @@ def main(config):
 
         try:
             positions, shape_name = generate_random_shape(
-                rng, grid, only_shape=config.get('only_shape'))
+                rng, grid,
+                only_shape=config.get('only_shape'),
+                hex_dl_min=config.get('hex_dl_min', 0.3),
+                hex_dl_max=config.get('hex_dl_max', 2.0),
+                include_hex_prism=not config.get('no_hex_prism', False),
+            )
             fft_mv = build_fft_matvec_from_positions(positions, m_re, m_im, kd, device)
         except Exception:
             continue
 
         # Build occupancy grid
-        occ_grid = positions_to_occupancy(positions, grid_size=grid, device=device)
+        occ_grid = positions_to_occupancy(positions, grid_size=None, device=device)
 
         # Forward: predict kernel from physical params + geometry
         kernel = model(m_re, m_im, kd, occ_grid, grid)
@@ -662,9 +1021,13 @@ def main(config):
         try:
             loss = compute_loss(model, kernel, fft_mv, config)
         except (torch.OutOfMemoryError, RuntimeError) as e:
-            if 'out of memory' in str(e).lower():
+            err_msg = str(e).lower()
+            if ('out of memory' in err_msg
+                    or 'cufft_internal_error' in err_msg
+                    or 'cufft error' in err_msg):
                 torch.cuda.empty_cache()
-                print(f"  OOM at step {step} (grid={grid}), skipping")
+                print(f"  CUDA memory/FFT error at step {step} (grid={grid}), skipping: "
+                      f"{str(e).splitlines()[0]}")
                 optimizer.zero_grad()
                 continue
             raise
@@ -679,6 +1042,8 @@ def main(config):
 
         optimizer.step()
         optimizer.zero_grad()
+        if device.type == 'cuda' and step % 25 == 0:
+            torch.cuda.empty_cache()
 
         # EMA update
         if ema_model is not None:
@@ -702,16 +1067,19 @@ def main(config):
                   f"({shape_name} g{grid} m={m_re:.2f}+{m_im:.2f}i kd={kd:.2f})")
             running_loss = 0.0
 
-        if step % val_interval == 0:
+        if val_interval > 0 and step % val_interval == 0:
             val_rng = np.random.RandomState(config["seed"] + step)
             probe_val = validate_probe(model, val_rng, config, device)
             scheduler.step(probe_val)
             logger.log_val(None, probe_val)
 
-        if step % solve_val_interval == 0:
-            val_metric = validate_fixed(model, device, encoder_resolution)
+        if solve_val_interval > 0 and step % solve_val_interval == 0:
+            val_metric, val_ok_for_best = validate_fixed(
+                model, config, device, encoder_resolution, return_status=True)
 
-            if val_metric < best_val:
+            if not val_ok_for_best:
+                print("  >>> Best update skipped: guarded large-grid gate failed")
+            elif val_metric < best_val:
                 if config["save"]:
                     save_model = model.base if isinstance(model, SquaredConvSAI) else model
                     torch.save(save_model.state_dict(),
@@ -721,8 +1089,11 @@ def main(config):
 
             # Also evaluate EMA model
             if ema_model is not None:
-                ema_val = validate_fixed(ema_model, device, encoder_resolution)
-                if ema_val < best_val:
+                ema_val, ema_ok_for_best = validate_fixed(
+                    ema_model, config, device, encoder_resolution, return_status=True)
+                if not ema_ok_for_best:
+                    print("  >>> EMA best update skipped: guarded large-grid gate failed")
+                elif ema_val < best_val:
                     if config["save"]:
                         save_ema = ema_model.base if isinstance(ema_model, SquaredConvSAI) else ema_model
                         torch.save(save_ema.state_dict(),
@@ -731,7 +1102,8 @@ def main(config):
                     print(f"  >>> New best (EMA): {best_val:.6f} (speedup {1/best_val:.2f}x)")
 
         if config["save"] and step % config.get("save_interval", 5000) == 0:
-            torch.save(model.state_dict(),
+            save_model = model.base if isinstance(model, SquaredConvSAI) else model
+            torch.save(save_model.state_dict(),
                        os.path.join(config['folder'], f"model_step{step}.pt"))
 
     total_time = time.perf_counter() - start_total
@@ -750,12 +1122,15 @@ def main(config):
 
     print(f"Best validation (inv_speedup): {best_val:.6f} (speedup {1/max(best_val, 1e-6):.2f}x)")
 
+    if config.get("skip_final_eval", False):
+        return
+
     print("\n=== Final evaluation (raw) ===")
-    validate_fixed(model, device, encoder_resolution)
+    validate_fixed(model, config, device, encoder_resolution)
 
     if ema_model is not None:
         print("\n=== Final evaluation (EMA) ===")
-        validate_fixed(ema_model, device, encoder_resolution)
+        validate_fixed(ema_model, config, device, encoder_resolution)
 
 
 if __name__ == "__main__":
@@ -767,10 +1142,19 @@ if __name__ == "__main__":
 
     # Loss function
     parser.add_argument("--loss", type=str, default="adversarial",
-                        choices=["probe", "adversarial", "right_probe", "gmres"])
+                        choices=["probe", "adversarial", "right_probe", "gmres",
+                                 "krylov", "anchored_krylov", "planewave_krylov",
+                                 "planewave_bicgstab"])
     parser.add_argument("--adversarial_iters", type=int, default=10)
     parser.add_argument("--gmres_iters", type=int, default=10)
     parser.add_argument("--gmres_rhs", type=int, default=2)
+    parser.add_argument("--krylov_iters", type=int, default=10)
+    parser.add_argument("--krylov_rhs", type=int, default=2)
+    parser.add_argument("--anchor_num_probes", type=int, default=1)
+    parser.add_argument("--anchor_probe_chunk", type=int, default=1)
+    parser.add_argument("--anchor_krylov_weight", type=float, default=1.0)
+    parser.add_argument("--anchor_probe_weight", type=float, default=0.5)
+    parser.add_argument("--anchor_right_probe_weight", type=float, default=0.2)
 
     # Training
     parser.add_argument("--seed", type=int, default=42)
@@ -781,6 +1165,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_probes", type=int, default=5)
     parser.add_argument("--val_interval", type=int, default=500)
     parser.add_argument("--solve_val_interval", type=int, default=2000)
+    parser.add_argument("--skip_final_eval", action='store_true',
+                        help="Skip final BiCGStab/ADDA validation after training")
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--save_interval", type=int, default=5000)
     parser.add_argument("--patience", type=int, default=500)
@@ -798,12 +1184,64 @@ if __name__ == "__main__":
                         help="Hidden dim for per-frequency MLP (spectral)")
     parser.add_argument("--freq_layers", type=int, default=3,
                         help="Layers for per-frequency MLP (spectral)")
+    parser.add_argument("--freq_residual_blocks", type=int, default=0,
+                        help="Residual blocks for legacy spectral v5 per-frequency MLP")
+    parser.add_argument("--spectral_correction_hidden", type=int, default=0,
+                        help="Hidden dim for zero-init additive spectral correction branch")
+    parser.add_argument("--spectral_correction_layers", type=int, default=2,
+                        help="Linear layers in additive spectral correction branch")
+    parser.add_argument("--spectral_correction_scale", type=float, default=1.0,
+                        help="Multiplier for additive spectral correction output")
+    parser.add_argument("--spectral_correction_penalty", type=float, default=0.0,
+                        help="L2 penalty on the scaled additive spectral correction")
+    parser.add_argument("--spectral_freeze_base", action='store_true',
+                        help="Train only spectral correction branch; keep resumed base fixed")
+    parser.add_argument("--spectral_transformer_tokens", type=int, default=0,
+                        help="Coarse frequency grid per axis for transformer context (0 = disabled)")
+    parser.add_argument("--spectral_transformer_dim", type=int, default=128,
+                        help="Hidden dim for spectral coarse transformer")
+    parser.add_argument("--spectral_transformer_layers", type=int, default=2,
+                        help="Transformer encoder layers for spectral coarse context")
+    parser.add_argument("--spectral_transformer_heads", type=int, default=4,
+                        help="Attention heads for spectral coarse transformer")
+    parser.add_argument("--spectral_transformer_scale", type=float, default=1.0,
+                        help="Multiplier for spectral transformer conditioning update")
     parser.add_argument("--global_hidden", type=int, default=256,
                         help="Hidden dim for global encoder (spectral)")
     parser.add_argument("--global_layers", type=int, default=3,
                         help="Layers for global encoder (spectral)")
     parser.add_argument("--no_freq_coords", action='store_true',
                         help="Disable frequency coordinates input (spectral)")
+    parser.add_argument("--spectral_normalize_inputs", action='store_true',
+                        help="Normalize spectral global inputs inside ConvSAI_Spectral")
+    parser.add_argument("--spectral_freq_chunk_size", type=int, default=0,
+                        help="Chunk per-frequency MLP evaluation to reduce memory (0 = disabled)")
+    parser.add_argument("--spectral_freq_checkpoint_chunks", action='store_true',
+                        help="Checkpoint spectral MLP chunks during training to reduce activation memory")
+    parser.add_argument("--spectral_log_grid_center", type=float, default=2.0)
+    parser.add_argument("--spectral_log_grid_scale", type=float, default=2.0)
+    parser.add_argument("--spectral_truncate_radius", type=int, default=None,
+                        help="Train Spectral loss through a spatially radius-limited M_hat")
+    parser.add_argument("--spectral_truncate_threshold_rel", type=float, default=0.0,
+                        help="Train Spectral loss through relative spatial-thresholded M_hat")
+    parser.add_argument("--spectral_identity_blend", type=float, default=1.0,
+                        help="Train Spectral loss on (1-lambda)*I + lambda*M_hat")
+    parser.add_argument("--export_threshold_rel", type=float, default=1e-8,
+                        help="Relative threshold for Spectral stencil export during ADDA validation")
+    parser.add_argument("--export_max_radius", type=int, default=None,
+                        help="Maximum spatial radius for Spectral export during ADDA validation")
+    parser.add_argument("--export_identity_blend", type=float, default=None,
+                        help="Identity blend lambda for Spectral export during ADDA validation")
+    parser.add_argument("--adda_val_np", type=int, default=16,
+                        help="MPI ranks for ADDA validation")
+    parser.add_argument("--adda_val_timeout", type=float, default=900.0,
+                        help="Timeout in seconds for one ADDA validation run")
+    parser.add_argument("--adda_val_maxiter_base", type=int, default=500,
+                        help="Baseline max iterations for large-grid ADDA validation")
+    parser.add_argument("--adda_val_maxiter_precond", type=int, default=2000,
+                        help="Preconditioned max iterations for large-grid ADDA validation")
+    parser.add_argument("--adda_mpi_bin", type=str, default="adda/src/mpi/adda_mpi")
+    parser.add_argument("--fftw_lib_path", type=str, default="~/.local/lib")
     parser.add_argument("--separable", action='store_true',
                         help="Use separable 1D kernel architecture")
     parser.add_argument("--hybrid", action='store_true',
@@ -847,9 +1285,21 @@ if __name__ == "__main__":
     parser.add_argument("--hard_sample_frac", type=float, default=0.5)
     parser.add_argument("--high_m", action='store_true',
                         help="Use high-m validation configs (m=4-6, smaller kd)")
+    parser.add_argument("--large_grid", action='store_true',
+                        help="Use large-grid validation (g12-24 inline, g48+ via ADDA MPI)")
+    parser.add_argument("--guarded_val", action='store_true',
+                        help="Use guarded validation (g32/g40 inline, g48 ADDA MPI)")
+    parser.add_argument("--guarded_min_large_speedup", type=float, default=1.0,
+                        help="Minimum speedup required on each guarded ADDA case before saving best")
     parser.add_argument("--only_shape", type=str, default=None,
                         choices=SHAPE_TYPES,
                         help="Train on only this shape type")
+    parser.add_argument("--no_hex_prism", action='store_true',
+                        help="Sample the legacy K2v3 shape set without hex_prism")
+    parser.add_argument("--hex_dl_min", type=float, default=0.3,
+                        help="Minimum D/L ratio for random hex_prism training shapes")
+    parser.add_argument("--hex_dl_max", type=float, default=2.0,
+                        help="Maximum D/L ratio for random hex_prism training shapes")
 
     args = parser.parse_args()
 
@@ -870,7 +1320,15 @@ if __name__ == "__main__":
     config['folder'] = folder
     config['scale_by_stencil'] = not config.pop('no_scale_by_stencil', False)
 
-    if args.high_m:
+    if args.guarded_val:
+        FIXED_VAL_CONFIGS.clear()
+        FIXED_VAL_CONFIGS.extend(FIXED_VAL_CONFIGS_GUARDED)
+        print("Using GUARDED validation (g32/g40 inline, g48 via ADDA MPI)")
+    elif args.large_grid:
+        FIXED_VAL_CONFIGS.clear()
+        FIXED_VAL_CONFIGS.extend(FIXED_VAL_CONFIGS_LARGE)
+        print("Using LARGE-GRID validation (g12-24 inline, g48+ via ADDA MPI)")
+    elif args.high_m:
         FIXED_VAL_CONFIGS.clear()
         FIXED_VAL_CONFIGS.extend(FIXED_VAL_CONFIGS_HIGH_M)
         print("Using HIGH-M validation configs (m=4-6, small kd)")

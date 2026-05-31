@@ -1524,6 +1524,68 @@ class ConvSAI_Hybrid(nn.Module):
         return precond_fn
 
 
+class ResidualFrequencyMLP(nn.Module):
+    """Frequency MLP variant used by older spectral checkpoints."""
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_blocks, activation='relu'):
+        super().__init__()
+        act = nn.GELU if activation == 'gelu' else nn.ReLU
+        self.proj_in = nn.Linear(input_dim, hidden_dim)
+        self.act_in = act()
+        self.blocks = nn.ModuleList([
+            nn.Sequential(nn.Linear(hidden_dim, hidden_dim), act(),
+                          nn.Linear(hidden_dim, hidden_dim))
+            for _ in range(num_blocks)
+        ])
+        self.proj_out = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = self.act_in(self.proj_in(x))
+        for block in self.blocks:
+            x = x + block(x)
+        return self.proj_out(x)
+
+
+class SpectralCoarseTransformer(nn.Module):
+    """Cheap global frequency-context branch for ConvSAI_Spectral.
+
+    The main Spectral ConvSAI MLP is pointwise in frequency. This branch samples
+    a small coarse grid of frequency tokens, lets them communicate with a
+    transformer, and returns an additive update to the global conditioning
+    vector. It is intentionally zero-initialized so existing resumed checkpoints
+    start with identical behavior until the branch is trained.
+    """
+
+    def __init__(self, input_dim, cond_dim, model_dim=128, num_layers=2,
+                 num_heads=4, mlp_ratio=2.0, scale=1.0):
+        super().__init__()
+        self.scale = float(scale)
+        self.token_proj = nn.Linear(input_dim, model_dim)
+        self.cond_proj = nn.Linear(cond_dim, model_dim)
+        layer = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=num_heads,
+            dim_feedforward=int(model_dim * mlp_ratio),
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(model_dim)
+        self.out = nn.Linear(model_dim, cond_dim)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, token_features, cond):
+        tokens = self.token_proj(token_features).unsqueeze(0)
+        cls = self.cond_proj(cond).view(1, 1, -1)
+        h = torch.cat([cls, tokens], dim=1)
+        h = self.encoder(h)
+        delta = self.out(self.norm(h[:, 0, :])).squeeze(0)
+        return delta * self.scale
+
+
 class ConvSAI_Spectral(nn.Module):
     """Pointwise spectral preconditioner — no stencil, no range limit.
 
@@ -1549,13 +1611,50 @@ class ConvSAI_Spectral(nn.Module):
                  global_hidden=256, global_layers=3,
                  shape_embed_dim=16, activation='relu',
                  squared=False, freq_coords=True,
-                 encoder_resolution=32, encoder_channels=(16, 32, 64)):
+                 encoder_resolution=32, encoder_channels=(16, 32, 64),
+                 normalize_inputs=False,
+                 freq_chunk_size=0,
+                 freq_checkpoint_chunks=False,
+                 freq_residual_blocks=0,
+                 correction_hidden=0,
+                 correction_layers=2,
+                 correction_scale=1.0,
+                 transformer_tokens=0,
+                 transformer_dim=128,
+                 transformer_layers=2,
+                 transformer_heads=4,
+                 transformer_scale=1.0,
+                 m_re_min=1.5, m_re_max=4.0,
+                 m_im_min=0.0, m_im_max=0.5,
+                 kd_min=0.2, kd_max=0.8,
+                 log_grid_center=2.0, log_grid_scale=2.0):
         super().__init__()
 
         self.shape_embed_dim = shape_embed_dim
         self.encoder_resolution = encoder_resolution
         self.squared = squared
         self.freq_coords = freq_coords
+        self.normalize_inputs = normalize_inputs
+        self.freq_chunk_size = int(freq_chunk_size or 0)
+        self.freq_checkpoint_chunks = bool(freq_checkpoint_chunks)
+        self.freq_residual_blocks = freq_residual_blocks
+        self.correction_hidden = int(correction_hidden or 0)
+        self.correction_layers = int(correction_layers or 2)
+        self.correction_scale = float(correction_scale)
+        self.transformer_tokens = int(transformer_tokens or 0)
+        self.transformer_dim = int(transformer_dim or 128)
+        self.transformer_layers = int(transformer_layers or 2)
+        self.transformer_heads = int(transformer_heads or 4)
+        self.transformer_scale = float(transformer_scale)
+        self._last_correction_penalty = None
+        self.m_re_min = m_re_min
+        self.m_re_max = m_re_max
+        self.m_im_min = m_im_min
+        self.m_im_max = m_im_max
+        self.kd_min = kd_min
+        self.kd_max = kd_max
+        self.log_grid_center = log_grid_center
+        self.log_grid_scale = log_grid_scale
 
         # 3D CNN shape encoder
         self.shape_encoder = ShapeEncoder3D(
@@ -1579,18 +1678,90 @@ class ConvSAI_Spectral(nn.Module):
         coord_input = 3 if freq_coords else 0
         freq_input = d_hat_input + coord_input + cond_dim
 
-        f_layers = [nn.Linear(freq_input, freq_hidden), act]
-        for _ in range(freq_layers - 2):
-            f_layers.extend([nn.Linear(freq_hidden, freq_hidden), act])
-        f_layers.append(nn.Linear(freq_hidden, 18))
-        self.freq_mlp = nn.Sequential(*f_layers)
+        if freq_residual_blocks:
+            self.freq_mlp = ResidualFrequencyMLP(
+                freq_input, freq_hidden, 18, int(freq_residual_blocks), activation
+            )
+        else:
+            f_layers = [nn.Linear(freq_input, freq_hidden), act]
+            for _ in range(freq_layers - 2):
+                f_layers.extend([nn.Linear(freq_hidden, freq_hidden), act])
+            f_layers.append(nn.Linear(freq_hidden, 18))
+            self.freq_mlp = nn.Sequential(*f_layers)
 
         # Zero-init last layer -> M_hat = I at start
-        last = self.freq_mlp[-1]
+        last = self.freq_mlp.proj_out if freq_residual_blocks else self.freq_mlp[-1]
         nn.init.zeros_(last.weight)
         nn.init.zeros_(last.bias)
 
+        self.correction_mlp = None
+        if self.correction_hidden > 0:
+            # Zero-initialized additive residual. This preserves old checkpoints
+            # exactly while allowing a small large-grid correction to be trained.
+            corr_input = d_hat_input + 7 + cond_dim
+            corr_layers = [nn.Linear(corr_input, self.correction_hidden), act]
+            for _ in range(max(self.correction_layers, 2) - 2):
+                corr_layers.extend([nn.Linear(self.correction_hidden, self.correction_hidden), act])
+            corr_layers.append(nn.Linear(self.correction_hidden, 18))
+            self.correction_mlp = nn.Sequential(*corr_layers)
+            nn.init.zeros_(self.correction_mlp[-1].weight)
+            nn.init.zeros_(self.correction_mlp[-1].bias)
+            self.register_buffer(
+                "_correction_scale",
+                torch.tensor(self.correction_scale, dtype=torch.float32),
+            )
+
         self.cond_dim = cond_dim
+        self.coarse_transformer = None
+        if self.transformer_tokens > 0:
+            self.coarse_transformer = SpectralCoarseTransformer(
+                input_dim=25,
+                cond_dim=cond_dim,
+                model_dim=self.transformer_dim,
+                num_layers=self.transformer_layers,
+                num_heads=self.transformer_heads,
+                scale=self.transformer_scale,
+            )
+
+    @staticmethod
+    def _signed_frequency_features(gx, gy, gz, device):
+        fx = torch.fft.fftfreq(gx, d=1.0).to(device=device, dtype=torch.float32)
+        fy = torch.fft.fftfreq(gy, d=1.0).to(device=device, dtype=torch.float32)
+        fz = torch.fft.fftfreq(gz, d=1.0).to(device=device, dtype=torch.float32)
+        sx, sy, sz = torch.meshgrid(fx, fy, fz, indexing='ij')
+        sx = sx.reshape(-1)
+        sy = sy.reshape(-1)
+        sz = sz.reshape(-1)
+        sx2 = sx.square()
+        sy2 = sy.square()
+        sz2 = sz.square()
+        r2 = sx2 + sy2 + sz2
+        return torch.stack([sx, sy, sz, sx2, sy2, sz2, r2], dim=1)
+
+    @staticmethod
+    def _coarse_frequency_features(D_real, gx, gy, gz, token_grid, device):
+        nx = min(int(token_grid), int(gx))
+        ny = min(int(token_grid), int(gy))
+        nz = min(int(token_grid), int(gz))
+        ix = torch.linspace(0, gx - 1, nx, device=device).round().long().unique()
+        iy = torch.linspace(0, gy - 1, ny, device=device).round().long().unique()
+        iz = torch.linspace(0, gz - 1, nz, device=device).round().long().unique()
+        mx, my, mz = torch.meshgrid(ix, iy, iz, indexing='ij')
+        flat = ((mx.reshape(-1) * gy) + my.reshape(-1)) * gz + mz.reshape(-1)
+
+        fx = torch.fft.fftfreq(gx, d=1.0).to(device=device, dtype=torch.float32)[ix]
+        fy = torch.fft.fftfreq(gy, d=1.0).to(device=device, dtype=torch.float32)[iy]
+        fz = torch.fft.fftfreq(gz, d=1.0).to(device=device, dtype=torch.float32)[iz]
+        sx, sy, sz = torch.meshgrid(fx, fy, fz, indexing='ij')
+        sx = sx.reshape(-1)
+        sy = sy.reshape(-1)
+        sz = sz.reshape(-1)
+        sx2 = sx.square()
+        sy2 = sy.square()
+        sz2 = sz.square()
+        r2 = sx2 + sy2 + sz2
+        coord = torch.stack([sx, sy, sz, sx2, sy2, sz2, r2], dim=1)
+        return torch.cat([D_real[flat], coord], dim=1)
 
     def forward(self, m_re, m_im, kd, occupancy_grid, grid):
         """Compute global conditioning vector from physics + shape."""
@@ -1602,6 +1773,13 @@ class ConvSAI_Spectral(nn.Module):
         m_im_t = torch.tensor([m_im], device=device, dtype=dtype)
         kd_t = torch.tensor([kd], device=device, dtype=dtype)
         log_grid_t = torch.tensor([math.log(grid)], device=device, dtype=dtype)
+
+        if self.normalize_inputs:
+            eps = 1e-12
+            m_re_t = (m_re_t - self.m_re_min) / max(self.m_re_max - self.m_re_min, eps)
+            m_im_t = (m_im_t - self.m_im_min) / max(self.m_im_max - self.m_im_min, eps)
+            kd_t = (kd_t - self.kd_min) / max(self.kd_max - self.kd_min, eps)
+            log_grid_t = (log_grid_t - self.log_grid_center) / max(self.log_grid_scale, eps)
 
         if occupancy_grid.dim() == 4:
             occupancy_grid = occupancy_grid.unsqueeze(0)
@@ -1640,6 +1818,11 @@ class ConvSAI_Spectral(nn.Module):
         D_real = torch.cat([D_flat.real.float(), D_flat.imag.float()], dim=1)  # (G, 18)
         D_real = D_real.to(device)
 
+        if self.coarse_transformer is not None:
+            token_features = self._coarse_frequency_features(
+                D_real, gx, gy, gz, self.transformer_tokens, device)
+            cond = cond + self.coarse_transformer(token_features, cond)
+
         # Build input features
         input_parts = [D_real]
 
@@ -1653,12 +1836,74 @@ class ConvSAI_Spectral(nn.Module):
             coords = torch.stack([cx.reshape(-1), cy.reshape(-1), cz.reshape(-1)], dim=1)
             input_parts.append(coords)
 
-        # Broadcast conditioning
-        cond_expanded = cond.unsqueeze(0).expand(G, -1)
-        input_parts.append(cond_expanded)
+        chunk_size = int(getattr(self, "freq_chunk_size", 0) or 0)
+        use_chunks = chunk_size > 0 and chunk_size < G
+        self._last_correction_penalty = None
 
-        freq_input = torch.cat(input_parts, dim=1)
-        residual = self.freq_mlp(freq_input)  # (G, 18)
+        if use_chunks:
+            from torch.utils.checkpoint import checkpoint
+
+            coord_full = input_parts[1] if self.freq_coords else None
+            corr_features_full = None
+            correction_penalty = None
+            if self.correction_mlp is not None:
+                corr_features_full = self._signed_frequency_features(gx, gy, gz, device)
+            residual_chunks = []
+
+            def run_mlp(x):
+                return self.freq_mlp(x)
+
+            def run_correction_mlp(x):
+                return self.correction_mlp(x)
+
+            for start in range(0, G, chunk_size):
+                end = min(start + chunk_size, G)
+                chunk_parts = [D_real[start:end]]
+                if coord_full is not None:
+                    chunk_parts.append(coord_full[start:end])
+                chunk_parts.append(cond.unsqueeze(0).expand(end - start, -1))
+                freq_input = torch.cat(chunk_parts, dim=1)
+                if self.freq_checkpoint_chunks and self.training and torch.is_grad_enabled():
+                    residual = checkpoint(run_mlp, freq_input, use_reentrant=False)
+                else:
+                    residual = self.freq_mlp(freq_input)
+                if self.correction_mlp is not None:
+                    corr_input = torch.cat([
+                        D_real[start:end],
+                        corr_features_full[start:end],
+                        cond.unsqueeze(0).expand(end - start, -1),
+                    ], dim=1)
+                    scale = self._correction_scale.to(device=device, dtype=residual.dtype)
+                    if self.freq_checkpoint_chunks and self.training and torch.is_grad_enabled():
+                        correction = checkpoint(
+                            run_correction_mlp, corr_input, use_reentrant=False
+                        ) * scale
+                    else:
+                        correction = self.correction_mlp(corr_input) * scale
+                    residual = residual + correction
+                    chunk_weight = float(end - start) / float(G)
+                    chunk_penalty = correction.float().square().mean() * chunk_weight
+                    correction_penalty = (
+                        chunk_penalty if correction_penalty is None
+                        else correction_penalty + chunk_penalty
+                    )
+                residual_chunks.append(residual)
+            residual = torch.cat(residual_chunks, dim=0)
+            self._last_correction_penalty = correction_penalty
+        else:
+            # Broadcast conditioning
+            cond_expanded = cond.unsqueeze(0).expand(G, -1)
+            input_parts.append(cond_expanded)
+
+            freq_input = torch.cat(input_parts, dim=1)
+            residual = self.freq_mlp(freq_input)  # (G, 18)
+            if self.correction_mlp is not None:
+                corr_features = self._signed_frequency_features(gx, gy, gz, device)
+                corr_input = torch.cat([D_real, corr_features, cond_expanded], dim=1)
+                correction = self.correction_mlp(corr_input) * self._correction_scale.to(
+                    device=device, dtype=residual.dtype)
+                residual = residual + correction
+                self._last_correction_penalty = correction.float().square().mean()
 
         import math
         residual = residual * (1.0 / math.sqrt(18))

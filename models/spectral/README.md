@@ -55,6 +55,58 @@ python train_v7/train.py \
 
 Время обучения: ~9 часов на RTX 3090 Ti.
 
+## Текущий large-grid checkpoint
+
+Файл:
+
+```text
+models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.pt
+```
+
+Размер: около 1.84 MiB. Это Spectral ConvSAI для hex-prism, обученный на
+grid 32..96, `m=3+0i`, `kd=2*pi/15`, с радиусом экспорта 40 и симметрией
+`z180_zflip` при real-ADDA проверке.
+
+Точная команда запуска обучения:
+
+```bash
+DEVICE=0 \
+SEED_BASE=6200 \
+CYCLES=200 \
+STEPS_PER_CYCLE=25 \
+LR=2e-6 \
+TRAIN_GRID_MIN=32 \
+TRAIN_GRID_MAX=96 \
+VAL_GRIDS=80,96 \
+SCORE_MODE=max \
+M_RE=3.0 \
+M_IM=0.0 \
+DPL=15 \
+KD=0.41887902047863906 \
+RADIUS=40 \
+LOSS=planewave_bicgstab \
+KRYLOV_ITERS=1 \
+ANCHOR_PROBE_WEIGHT=0.0 \
+ANCHOR_RIGHT_PROBE_WEIGHT=0.0 \
+SPECTRAL_FREQ_CHUNK_SIZE=65536 \
+SPECTRAL_FREQ_CHECKPOINT_CHUNKS=1 \
+CURRICULUM_FRAC=0.0 \
+NP=16 \
+VAL_MAXITER=120 \
+VAL_TIMEOUT=600 \
+EXPORT_SYMMETRY=z180_zflip \
+START_CHECKPOINT=models/spectral/checkpoints/best_hex_prism_real_32to96_r40.pt \
+BEST_CHECKPOINT=models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.pt \
+BEST_SCORE_FILE=models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.score \
+NAME_PREFIX=SPECTRAL_QUALITY10H_G32TO96_SYM_R40_20260525_100039 \
+RUN_ROOT=runs/SPECTRAL_QUALITY10H_G32TO96_SYM_R40_20260525_100039 \
+./train_spectral_hex_real_loop.sh
+```
+
+Скрипт обучает короткими блоками по 25 шагов, экспортирует кандидата в ADDA,
+проверяет реальные запуски на `G80` и `G96`, и заменяет `BEST_CHECKPOINT`
+только если худший residual на проверке стал меньше.
+
 ## Экспорт для ADDA
 
 Spectral модель предсказывает M_hat для конкретной задачи. Экспорт нужен для каждой комбинации (форма, grid, m, kd).
@@ -65,6 +117,24 @@ python apps/export_spectral_precond.py \
     --shape sphere --grid 33 \
     --m_re 3.0 --m_im 0.0 --kd 0.4189 \
     --output /tmp/precond.precond
+```
+
+Пример экспорта текущего large-grid checkpoint для hex-prism `G80, m=2.5+0i`:
+
+```bash
+mkdir -p exports
+
+python3 apps/export_spectral_precond.py \
+    --checkpoint models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.pt \
+    --shape prism --ay 6.0 --az 1.0 \
+    --grid 80 \
+    --m_re 2.5 --m_im 0.0 \
+    --kd 0.41887902047863906 \
+    --threshold-rel 1e-6 \
+    --max-radius 40 \
+    --blend-identity 1.0 \
+    --symmetry z180_zflip \
+    --output exports/prism_g80_m25_quality10h_sym.precond
 ```
 
 Что делает скрипт:
@@ -84,6 +154,38 @@ adda/src/seq/adda \
     -precond /tmp/precond.precond
 ```
 
+MPI пример импорта этого `.precond` в ADDA:
+
+```bash
+export LD_LIBRARY_PATH="$HOME/.local/lib:${LD_LIBRARY_PATH:-}"
+
+mpirun -np 16 adda/src/mpi/adda_mpi \
+    -dir runs/prism_g80_m25_mpi_quality10h_sym \
+    -grid 80 \
+    -m 2.5 0.0 \
+    -shape prism 6.0 1.0 \
+    -dpl 15 \
+    -eps 3 \
+    -iter bicgstab \
+    -precond exports/prism_g80_m25_quality10h_sym.precond
+```
+
+Для больших задач можно пробовать экспериментальный FGMRES, который применяет
+прекондиционер один раз на шаг Arnoldi:
+
+```bash
+ADDA_FGMRES_RESTART=100 \
+mpirun -np 16 adda/src/mpi/adda_mpi \
+    -dir runs/prism_g80_m25_mpi_quality10h_sym_fgmres \
+    -grid 80 \
+    -m 2.5 0.0 \
+    -shape prism 6.0 1.0 \
+    -dpl 15 \
+    -eps 3 \
+    -iter fgmres \
+    -precond exports/prism_g80_m25_quality10h_sym.precond
+```
+
 ### КРИТИЧЕСКИ ВАЖНО
 
 - Используйте **`-grid N -dpl 15`** (точный kd = 2π/15)
@@ -93,6 +195,8 @@ adda/src/seq/adda \
 ## Файлы
 
 - `checkpoints/best_model.pt` — обученные веса (1.9 MB)
+- `checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.pt` — текущий
+  large-grid hex-prism checkpoint (1.9 MB)
 - `../../train_v7/train.py` — скрипт обучения (с флагом `--spectral`)
 - `../../apps/export_spectral_precond.py` — скрипт экспорта
 - `../../neural_precond/model.py` — класс `ConvSAI_Spectral`

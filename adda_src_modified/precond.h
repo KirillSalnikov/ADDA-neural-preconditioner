@@ -3,7 +3,7 @@
  * Loads a preconditioner from a binary .precond file and applies it as left preconditioning
  * in BiCGStab: solve M*A*x = M*b.
  *
- * Four modes:
+ * Modes:
  *   mode=0 (ILU): L (lower) and U (upper) triangular factors. Apply via forward+backward solve:
  *                  solve L*z = in, then U*out = z. This computes out = (L*U)^{-1} * in.
  *   mode=1 (SAI): M is a general sparse matrix. Apply via SpMV: out = M * in.
@@ -11,6 +11,10 @@
  *                   Horner's method using ADDA's own MatVec. Zero extra memory beyond coefficients.
  *   mode=3 (CONVSAI): Translation-invariant convolution kernel. Applied via FFT convolution for large kernels
  *                      or direct sparse convolution for small kernels.
+ *   mode=4 (FFTDIRECT): Same FFT convolution apply as CONVSAI, but the frequency-domain 3x3 kernel is stored
+ *                       directly in the file. This avoids rebuilding Phat with 9 FFTs during import.
+ *   mode=5 (FFTDIRECT_XSLAB_F32): Same as mode=4, but stored as x-slab-major complex float32.
+ *                       MPI ranks read one contiguous local x-slab and convert to double in memory.
  *
  * The actual residual ||b - A*x|| / ||b|| is tracked algebraically using intermediate A*p and A*s
  * values (before M is applied), so no extra MatVec is needed per iteration.
@@ -29,6 +33,7 @@
 #define PRECOND_MODE_POLY 2
 #define PRECOND_MODE_CONVSAI 3
 #define PRECOND_MODE_FFTDIRECT 4
+#define PRECOND_MODE_FFTDIRECT_XSLAB_F32 5
 
 typedef struct {
 	size_t n;
@@ -63,6 +68,7 @@ typedef struct {
 	uint64_t *conv_direct_dipole;    // direct mode: neighbor entry -> global dipole index
 	uint32_t *conv_direct_stencil;   // direct mode: neighbor entry -> stencil index
 	doublecomplex *conv_Phat;        // frequency-domain kernel: 9 * conv_gridN complex values
+	doublecomplex *conv_Phat_local;  // MPI distributed mode: local frequency-major blocks of 9 complex values
 	doublecomplex *conv_work_in;     // work buffer for input:  3 * conv_gridN
 	doublecomplex *conv_work_out;    // work buffer for output: 3 * conv_gridN
 	void *conv_plan_fwd;             // fftw_plan forward (cast to void* to avoid fftw3.h in header)
@@ -79,6 +85,8 @@ extern PrecondData precond;
 
 void PrecondLoad(const char *filename);
 void PrecondApply(const doublecomplex *in,doublecomplex *out,size_t n);
+bool PrecondCanApplyMatVecFused(void);
+void PrecondApplyMatVecFused(const doublecomplex *in,doublecomplex *out,size_t n);
 void PrecondApplyScaled(const doublecomplex *in,doublecomplex *out,size_t n);
 void PrecondFree(void);
 void DumpDhat(const char *filename);

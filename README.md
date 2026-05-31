@@ -53,6 +53,9 @@ Exporter: `apps/export_spectral_precond.py`
 Default checkpoint:
 `models/spectral/checkpoints/best_model.pt`
 
+Large-grid hex-prism checkpoint used for the current ADDA heatmaps:
+`models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.pt`
+
 Spectral ConvSAI predicts the preconditioner directly in the FFT domain. For
 each frequency point it sees:
 
@@ -77,7 +80,8 @@ The ADDA integration supports:
   - `mode=1`: sparse SAI;
   - `mode=2`: polynomial preconditioner;
   - `mode=3`: ConvSAI FFT/direct convolution;
-  - `mode=4`: FFTDIRECT, experimental full frequency-domain preconditioner.
+  - `mode=4`: FFTDIRECT, cached full frequency-domain ConvSAI kernel;
+  - `mode=5`: FFTDIRECT x-slab float32, experimental MPI import format.
 
 ConvSAI has two apply paths:
 
@@ -104,6 +108,96 @@ ADDA_CONVSAI_DISTRIBUTED=0 mpirun -np 8 adda/src/mpi/adda_mpi ...
 ```
 
 Do not use that fallback for performance measurements unless you are debugging.
+
+For `-orient avg`, ADDA loads `-precond` once before the orientation loop. The
+expensive startup cost for large `mode=3` ConvSAI files is rebuilding the
+frequency-domain kernel with 9 FFTs. Convert such files once to `mode=4`
+FFTDIRECT to cache that kernel and make later imports much cheaper:
+
+```bash
+python3 apps/convert_convsai_to_fftdirect.py \
+  --input exports/prism_g80_m25_spectral.precond \
+  --output exports/prism_g80_m25_spectral.fftdirect.precond \
+  --grid-x 160 \
+  --grid-y 192 \
+  --grid-z 160
+```
+
+Use ADDA's actual FFT grid dimensions from the ADDA `log` file, not just the
+particle `-grid` value. Then pass the cached file normally:
+
+```bash
+mpirun -np 16 adda/src/mpi/adda_mpi ... \
+  -orient avg orient_params.dat \
+  -precond exports/prism_g80_m25_spectral.fftdirect.precond
+```
+
+An experimental `mode=5` format is also available for import-heavy workflows.
+It converts a `mode=4` file to x-slab-major complex float32, so MPI ranks read
+their local frequency-domain slab with one contiguous read and the file is about
+2x smaller:
+
+```bash
+python3 apps/convert_fftdirect_to_xslab_f32.py \
+  --input exports/prism_g80_m25_spectral.fftdirect.precond \
+  --output exports/prism_g80_m25_spectral.xslab_f32.precond
+```
+
+ADDA converts `mode=5` values back to `doublecomplex` in memory. Local tests
+showed that it loads correctly, but float32 storage can slightly change
+iteration counts, so keep `mode=4` as the default accuracy/performance baseline
+unless startup I/O dominates the run.
+
+There is also an experimental periodic correction mode:
+
+```bash
+ADDA_PRECOND_PERIODIC_CORRECTION=100 \
+ADDA_PRECOND_PERIODIC_RELAX=1.0 \
+mpirun -np 16 adda/src/mpi/adda_mpi ... \
+  -iter bicgstab \
+  -precond exports/prism_g80_m25_spectral.fftdirect.precond
+```
+
+This disables left preconditioning and tries `x <- x + relax*M*r` every `K`
+ordinary BiCGStab iterations, accepting the trial only if the true residual does
+not get worse. It is useful for experiments with cheaper occasional neural
+corrections, but current local G32 tests did not beat the normal `mode=4`
+left-preconditioned solve.
+
+For large FFTDIRECT neural preconditioners, an experimental right-preconditioned
+FGMRES solver can reduce the number of expensive preconditioner applications:
+
+```bash
+ADDA_FGMRES_RESTART=100 \
+mpirun -np 16 adda/src/mpi/adda_mpi ... \
+  -iter fgmres \
+  -precond exports/prism_g80_m25_spectral.fftdirect.precond
+```
+
+`-iter fgmres` applies `M` once per Arnoldi step, while the BiCGStab
+left-preconditioned path applies `M` twice per iteration. Current local tests on
+G80 favored `ADDA_FGMRES_RESTART=100` and reduced wall time from 83.97 s
+(`bicgstab`) to 72.07 s. On small G32 cases the result is noisy and may not beat
+BiCGStab, so use FGMRES primarily for larger grids. This is still experimental
+and uses more memory for the Krylov basis.
+
+To benchmark the FGMRES path over the spectral preconditioner heatmap:
+
+```bash
+python3 apps/benchmark_spectral_heatmap_mpi.py \
+  --grids 32,48,64,80,96 \
+  --m-re-values 1.5,2.0,2.5,3.0,3.5 \
+  --precond-iter fgmres \
+  --fgmres-restart 100 \
+  --maxiter 20000 \
+  --np 16 \
+  --adda-timeout 3600 \
+  --export-timeout 1800
+```
+
+The script writes speedup heatmaps and absolute wall-time heatmaps, including
+`heatmap_adda_wall_speedup.png`, `heatmap_precond_wall_s.png`, and
+`heatmap_total_elapsed_speedup.png`.
 
 Recent local validation after the distributed MPI fix:
 
@@ -300,6 +394,49 @@ python3 train_v7/train.py \
   --lr 1e-3
 ```
 
+The checked large-grid hex-prism checkpoint
+`models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.pt`
+was trained with a real-ADDA promotion loop. The loop starts from
+`best_hex_prism_real_32to96_r40.pt`, trains 25-step chunks, exports each
+candidate with `--symmetry z180_zflip`, evaluates ADDA on grids 80 and 96, and
+keeps the candidate only when the worst validation residual improves.
+
+Exact launch command used for that run:
+
+```bash
+DEVICE=0 \
+SEED_BASE=6200 \
+CYCLES=200 \
+STEPS_PER_CYCLE=25 \
+LR=2e-6 \
+TRAIN_GRID_MIN=32 \
+TRAIN_GRID_MAX=96 \
+VAL_GRIDS=80,96 \
+SCORE_MODE=max \
+M_RE=3.0 \
+M_IM=0.0 \
+DPL=15 \
+KD=0.41887902047863906 \
+RADIUS=40 \
+LOSS=planewave_bicgstab \
+KRYLOV_ITERS=1 \
+ANCHOR_PROBE_WEIGHT=0.0 \
+ANCHOR_RIGHT_PROBE_WEIGHT=0.0 \
+SPECTRAL_FREQ_CHUNK_SIZE=65536 \
+SPECTRAL_FREQ_CHECKPOINT_CHUNKS=1 \
+CURRICULUM_FRAC=0.0 \
+NP=16 \
+VAL_MAXITER=120 \
+VAL_TIMEOUT=600 \
+EXPORT_SYMMETRY=z180_zflip \
+START_CHECKPOINT=models/spectral/checkpoints/best_hex_prism_real_32to96_r40.pt \
+BEST_CHECKPOINT=models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.pt \
+BEST_SCORE_FILE=models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.score \
+NAME_PREFIX=SPECTRAL_QUALITY10H_G32TO96_SYM_R40_20260525_100039 \
+RUN_ROOT=runs/SPECTRAL_QUALITY10H_G32TO96_SYM_R40_20260525_100039 \
+./train_spectral_hex_real_loop.sh
+```
+
 Useful Spectral export-validation options during training:
 
 ```bash
@@ -361,6 +498,27 @@ Optional symmetry averaging for compatible prism cases:
 Spectral export is problem-specific. Re-export when shape, grid, refractive
 index, or `dpl/kd` changes.
 
+Example using the checked large-grid hex-prism checkpoint:
+
+```bash
+mkdir -p exports
+
+python3 apps/export_spectral_precond.py \
+  --checkpoint models/spectral/checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.pt \
+  --shape prism \
+  --ay 6.0 \
+  --az 1.0 \
+  --grid 80 \
+  --m_re 2.5 \
+  --m_im 0.0 \
+  --kd 0.41887902047863906 \
+  --threshold-rel 1e-6 \
+  --max-radius 40 \
+  --blend-identity 1.0 \
+  --symmetry z180_zflip \
+  --output exports/prism_g80_m25_quality10h_sym.precond
+```
+
 ## Run ADDA Sequential
 
 Baseline without a preconditioner:
@@ -396,6 +554,22 @@ adda/src/seq/adda \
 
 The same command works for a ConvSAI Universal/K^2 `.precond` file; only the
 path after `-precond` changes.
+
+Checked large-grid hex-prism example:
+
+```bash
+export LD_LIBRARY_PATH="$HOME/.local/lib:${LD_LIBRARY_PATH:-}"
+
+adda/src/seq/adda \
+  -dir runs/prism_g80_m25_seq_quality10h_sym \
+  -grid 80 \
+  -m 2.5 0.0 \
+  -shape prism 6.0 1.0 \
+  -dpl 15 \
+  -eps 3 \
+  -iter bicgstab \
+  -precond exports/prism_g80_m25_quality10h_sym.precond
+```
 
 ## Run ADDA MPI
 
@@ -452,6 +626,24 @@ For debugging only, force the old replicated full-grid path:
 ADDA_CONVSAI_DISTRIBUTED=0 mpirun -np 8 adda/src/mpi/adda_mpi ...
 ```
 
+For large FFTDIRECT/preconditioner-heavy cases, the experimental FGMRES path can
+reduce preconditioner applications:
+
+```bash
+export LD_LIBRARY_PATH="$HOME/.local/lib:${LD_LIBRARY_PATH:-}"
+
+ADDA_FGMRES_RESTART=100 \
+mpirun -np 16 adda/src/mpi/adda_mpi \
+  -dir runs/prism_g80_m25_mpi_quality10h_sym_fgmres \
+  -grid 80 \
+  -m 2.5 0.0 \
+  -shape prism 6.0 1.0 \
+  -dpl 15 \
+  -eps 3 \
+  -iter fgmres \
+  -precond exports/prism_g80_m25_quality10h_sym.precond
+```
+
 ## Inspect ADDA Results
 
 ADDA writes a `log` file in the `-dir` directory. Useful lines:
@@ -473,6 +665,8 @@ models/k2v3/
 
 models/spectral/
   checkpoints/best_model.pt        ConvSAI_Spectral checkpoint
+  checkpoints/best_hex_prism_real_32to96_r40_quality10h_sym.pt
+                                   Checked hex-prism 32..96 checkpoint
 
 neural_precond/model.py            Model classes:
                                    ConvSAI_Universal, ConvSAI_Spectral,
