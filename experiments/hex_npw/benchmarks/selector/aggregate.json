@@ -1,0 +1,93 @@
+{
+  "all": {
+    "plain": {
+      "total": 20.80901181849913,
+      "ratio": 2.6496211058338144,
+      "geomean": 1.1514092944109753,
+      "neural_faster": 4,
+      "iterations": 3998.0
+    },
+    "npw": {
+      "total": 23.801245650491182,
+      "ratio": 3.0306236245496683,
+      "geomean": 1.623230471765735,
+      "neural_faster": 8,
+      "iterations": 1723.5
+    },
+    "fixed": {
+      "total": 8.25584534150039,
+      "ratio": 1.051220608366061,
+      "geomean": 1.0322594403116039,
+      "neural_faster": 4,
+      "iterations": 537.0
+    },
+    "nn": {
+      "total": 7.853580186496401,
+      "ratio": 1.0,
+      "geomean": 1.0,
+      "neural_faster": 0,
+      "iterations": 530.0
+    }
+  },
+  "m2.05": {
+    "plain": {
+      "total": 1.4447911384995678,
+      "ratio": 0.6996071536701094,
+      "geomean": 0.6329404784691485,
+      "neural_faster": 0,
+      "iterations": 226.5
+    },
+    "npw": {
+      "total": 2.274580770990724,
+      "ratio": 1.1014138560111741,
+      "geomean": 1.0868663440657413,
+      "neural_faster": 4,
+      "iterations": 121.0
+    },
+    "fixed": {
+      "total": 2.2656330684985733,
+      "ratio": 1.097081135173115,
+      "geomean": 1.0506483126662205,
+      "neural_faster": 2,
+      "iterations": 112.0
+    },
+    "nn": {
+      "total": 2.0651463195026736,
+      "ratio": 1.0,
+      "geomean": 1.0,
+      "neural_faster": 0,
+      "iterations": 106.0
+    }
+  },
+  "m2.95": {
+    "plain": {
+      "total": 19.364220679999562,
+      "ratio": 3.345329863819716,
+      "geomean": 2.0945782555454,
+      "neural_faster": 4,
+      "iterations": 3771.5
+    },
+    "npw": {
+      "total": 21.52666487950046,
+      "ratio": 3.718910049615979,
+      "geomean": 2.4242881186404968,
+      "neural_faster": 4,
+      "iterations": 1602.5
+    },
+    "fixed": {
+      "total": 5.990212273001816,
+      "ratio": 1.0348588945895454,
+      "geomean": 1.014192417449722,
+      "neural_faster": 2,
+      "iterations": 425.0
+    },
+    "nn": {
+      "total": 5.788433866993728,
+      "ratio": 1.0,
+      "geomean": 1.0,
+      "neural_faster": 0,
+      "iterations": 424.0
+    }
+  },
+  "largest_field_error": 0.00011083306183725145
+}

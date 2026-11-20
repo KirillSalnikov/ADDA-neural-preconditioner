@@ -1,0 +1,82 @@
+{
+  "primary": [
+    [
+      0.65,
+      20,
+      2.15
+    ],
+    [
+      0.65,
+      20,
+      3.0
+    ],
+    [
+      0.65,
+      22,
+      2.15
+    ],
+    [
+      0.65,
+      22,
+      3.0
+    ],
+    [
+      1.1,
+      20,
+      2.15
+    ],
+    [
+      1.1,
+      20,
+      3.0
+    ],
+    [
+      1.1,
+      22,
+      2.15
+    ],
+    [
+      1.1,
+      22,
+      3.0
+    ]
+  ],
+  "upper_index": [
+    [
+      0.65,
+      20,
+      3.2
+    ],
+    [
+      0.65,
+      22,
+      3.2
+    ],
+    [
+      1.1,
+      20,
+      3.2
+    ],
+    [
+      1.1,
+      22,
+      3.2
+    ]
+  ],
+  "reference_eps": 9,
+  "target_eps": 5,
+  "metrics": [
+    "elapsed_process_including_setup",
+    "iterations",
+    "true_residual",
+    "relative_internal_field"
+  ],
+  "methods": [
+    "plain",
+    "NPW Hann 0.05",
+    "training-best fixed",
+    "timing gate + training-best fixed",
+    "timing gate + MLP"
+  ],
+  "repeats": 3
+}

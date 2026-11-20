@@ -1,0 +1,39 @@
+{
+  "accepted": true,
+  "cases": 12,
+  "plain": {
+    "total": 39.260423946994706,
+    "time_ratio": 3.306482196817062,
+    "geomean": 2.0351487018940806,
+    "wins": 9,
+    "iterations": 10096
+  },
+  "npw": {
+    "total": 40.45650847397337,
+    "time_ratio": 3.407215500147732,
+    "geomean": 1.814530901552747,
+    "wins": 12,
+    "iterations": 3712
+  },
+  "fixed": {
+    "total": 12.369233147990599,
+    "time_ratio": 1.0417271409836897,
+    "geomean": 1.1454341188480341,
+    "wins": 7,
+    "iterations": 1067
+  },
+  "gate_fixed": {
+    "total": 11.746931564979604,
+    "time_ratio": 0.9893173884029502,
+    "geomean": 0.996771224691661,
+    "wins": 4,
+    "iterations": 1210
+  },
+  "model": {
+    "total": 11.87377448600455,
+    "time_ratio": 1.0,
+    "geomean": 1.0,
+    "wins": 0,
+    "iterations": 1208
+  }
+}

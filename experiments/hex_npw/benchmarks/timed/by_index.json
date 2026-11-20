@@ -1,0 +1,98 @@
+{
+  "2.15": {
+    "plain": {
+      "total": 1.4124453440017533,
+      "iterations": 271,
+      "max_field": 5.950205663368632e-05,
+      "ok": true
+    },
+    "npw": {
+      "total": 2.2768867039849283,
+      "iterations": 154,
+      "max_field": 1.9432809548076656e-05,
+      "ok": true
+    },
+    "fixed": {
+      "total": 2.0505492999946,
+      "iterations": 126,
+      "max_field": 5.115998612061762e-05,
+      "ok": true
+    },
+    "gate_fixed": {
+      "total": 1.4164476849909988,
+      "iterations": 271,
+      "max_field": 4.735148658585137e-05,
+      "ok": true
+    },
+    "model": {
+      "total": 1.4206528430004255,
+      "iterations": 271,
+      "max_field": 5.950205663368632e-05,
+      "ok": true
+    }
+  },
+  "3.0": {
+    "plain": {
+      "total": 13.472337154002162,
+      "iterations": 3385,
+      "max_field": 0.00012414102781196552,
+      "ok": true
+    },
+    "npw": {
+      "total": 5.48301867400005,
+      "iterations": 495,
+      "max_field": 4.3877281628148265e-05,
+      "ok": true
+    },
+    "fixed": {
+      "total": 4.5020314659996075,
+      "iterations": 392,
+      "max_field": 8.44553872221778e-05,
+      "ok": true
+    },
+    "gate_fixed": {
+      "total": 4.530907315987861,
+      "iterations": 392,
+      "max_field": 0.00011796168548384848,
+      "ok": true
+    },
+    "model": {
+      "total": 4.55067484400206,
+      "iterations": 390,
+      "max_field": 8.44553872221778e-05,
+      "ok": true
+    }
+  },
+  "3.2": {
+    "plain": {
+      "total": 24.37564144899079,
+      "iterations": 6440,
+      "max_field": 0.00010989971016879944,
+      "ok": true
+    },
+    "npw": {
+      "total": 32.696603095988394,
+      "iterations": 3063,
+      "max_field": 4.969937643635395e-05,
+      "ok": true
+    },
+    "fixed": {
+      "total": 5.816652381996391,
+      "iterations": 549,
+      "max_field": 0.00012140506092688166,
+      "ok": true
+    },
+    "gate_fixed": {
+      "total": 5.799576564000745,
+      "iterations": 547,
+      "max_field": 0.00013068541498389,
+      "ok": true
+    },
+    "model": {
+      "total": 5.902446799002064,
+      "iterations": 547,
+      "max_field": 0.0001729106840706338,
+      "ok": true
+    }
+  }
+}

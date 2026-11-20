@@ -1,0 +1,9 @@
+run/
+*.o
+*.d
+.copts
+.fopts
+.ldopts
+githash.h
+native/src/seq/adda
+native/src/mpi/adda_mpi

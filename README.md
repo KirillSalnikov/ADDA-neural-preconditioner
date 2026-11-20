@@ -750,3 +750,7 @@ the ones to document and compare by default.
   neural-network building blocks.
 - [autoresearch](https://github.com/karpathy/autoresearch), used for automated
   experiment search during earlier model exploration.
+
+## Hexagonal prisms with matched NPW
+
+A separate native ADDA experiment learns when to build a windowed spectral preconditioner and which parameters to use. It includes an upstream ADDA comparison, a tuned constant kernel, and the same learned timing decision paired with that constant kernel. [Build instructions, trained weights and measured results](experiments/hex_npw/README.md)

@@ -1,0 +1,13 @@
+# Build outputs of ADDA (compiled in seq/, mpi/ or ocl/)
+*.o
+*.d
+*.mod
+seq/adda
+mpi/adda_mpi
+ocl/adda_ocl
+__pycache__/
+# Compiler option caches written by the Makefiles
+.copts
+.fopts
+.ldopts
+githash.h
